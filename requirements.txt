@@ -36,6 +36,11 @@ streamlit             # Interactive web UI — play against the AI in the browse
 stockfish             # Python wrapper for Stockfish — used for ELO evaluation
 
 # ------------------------------------------------------------
+# Testing
+# ------------------------------------------------------------
+pytest                 # Unit testing framework for validating environment and model components
+
+# ------------------------------------------------------------
 # Optional — Experiment Tracking
 # ------------------------------------------------------------
 tensorboard          # Comment/Uncomment to disable/enable TensorBoard training dashboards
