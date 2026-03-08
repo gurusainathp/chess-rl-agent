@@ -1,0 +1,41 @@
+# ============================================================
+# Chess RL Agent — Requirements
+# ============================================================
+
+# ------------------------------------------------------------
+# Chess Environment
+# ------------------------------------------------------------
+python-chess          # Board state management, legal move validation, PGN parsing
+
+# ------------------------------------------------------------
+# Deep Learning
+# ------------------------------------------------------------
+torch                 # Neural network (policy + value networks), GPU training support
+
+# ------------------------------------------------------------
+# Data & Numerical Computing
+# ------------------------------------------------------------
+numpy                 # Array operations, board tensor encoding
+pandas                # Storing and analysing training logs / game histories
+scipy                 # Statistical analysis, ELO calculations
+
+# ------------------------------------------------------------
+# Visualisation & Progress Tracking
+# ------------------------------------------------------------
+matplotlib            # Training curves, reward plots, ELO progression charts
+tqdm                  # Progress bars for training loops and self-play episodes
+
+# ------------------------------------------------------------
+# User Interface
+# ------------------------------------------------------------
+streamlit             # Interactive web UI — play against the AI in the browser
+
+# ------------------------------------------------------------
+# Engine Evaluation
+# ------------------------------------------------------------
+stockfish             # Python wrapper for Stockfish — used for ELO evaluation
+
+# ------------------------------------------------------------
+# Optional — Experiment Tracking
+# ------------------------------------------------------------
+tensorboard          # Comment/Uncomment to disable/enable TensorBoard training dashboards
