@@ -52,58 +52,62 @@ from src.training.train_policy import load_checkpoint
 # Unicode board renderer
 # ---------------------------------------------------------------------------
 
-_PIECE_SYMBOLS = {
-    (chess.PAWN,   chess.WHITE): "♙",
-    (chess.KNIGHT, chess.WHITE): "♘",
-    (chess.BISHOP, chess.WHITE): "♗",
-    (chess.ROOK,   chess.WHITE): "♖",
-    (chess.QUEEN,  chess.WHITE): "♕",
-    (chess.KING,   chess.WHITE): "♔",
-    (chess.PAWN,   chess.BLACK): "♟",
-    (chess.KNIGHT, chess.BLACK): "♞",
-    (chess.BISHOP, chess.BLACK): "♝",
-    (chess.ROOK,   chess.BLACK): "♜",
-    (chess.QUEEN,  chess.BLACK): "♛",
-    (chess.KING,   chess.BLACK): "♚",
+# Piece letters: uppercase = White, lowercase = Black (standard chess notation)
+_PIECE_LETTERS = {
+    (chess.PAWN,   chess.WHITE): "P",
+    (chess.KNIGHT, chess.WHITE): "N",
+    (chess.BISHOP, chess.WHITE): "B",
+    (chess.ROOK,   chess.WHITE): "R",
+    (chess.QUEEN,  chess.WHITE): "Q",
+    (chess.KING,   chess.WHITE): "K",
+    (chess.PAWN,   chess.BLACK): "p",
+    (chess.KNIGHT, chess.BLACK): "n",
+    (chess.BISHOP, chess.BLACK): "b",
+    (chess.ROOK,   chess.BLACK): "r",
+    (chess.QUEEN,  chess.BLACK): "q",
+    (chess.KING,   chess.BLACK): "k",
 }
-
-_LIGHT_SQUARE = "\033[48;5;229m"   # pale yellow
-_DARK_SQUARE  = "\033[48;5;94m"    # brown
-_RESET        = "\033[0m"
-_BOLD         = "\033[1m"
 
 
 def render_board(board: chess.Board, human_is_white: bool) -> str:
     """
-    Render the board as a Unicode string with coloured squares.
+    Render the board as a clean fixed-width ASCII grid.
 
-    The board is always shown from the human's perspective:
-    - Human plays White → rank 8 at top, rank 1 at bottom
-    - Human plays Black → rank 1 at top, rank 8 at bottom
+    Works correctly on all terminals including Windows PowerShell.
+
+    Layout (human plays White):
+        8 | r n b q k b n r |
+        7 | p p p p p p p p |
+        ...
+        1 | R N B Q K B N R |
+            a b c d e f g h
+
+    Uppercase letters = White pieces, lowercase = Black pieces.
+    Dots (.) mark empty squares.
+    Light/dark squares shown by spacing only — no ANSI colours
+    so alignment is always perfect regardless of terminal support.
     """
-    lines = []
     ranks = range(7, -1, -1) if human_is_white else range(0, 8)
     files = range(0, 8)      if human_is_white else range(7, -1, -1)
+    file_chars = "abcdefgh" if human_is_white else "hgfedcba"
 
-    file_labels = "  a b c d e f g h" if human_is_white else "  h g f e d c b a"
-    lines.append(f"\n{_BOLD}{file_labels}{_RESET}")
+    border = "  +" + "---+" * 8
+    lines  = ["", border]
 
     for rank in ranks:
-        row = f"{_BOLD}{rank + 1} {_RESET}"
+        cells = []
         for file in files:
-            square  = chess.square(file, rank)
-            piece   = board.piece_at(square)
-            is_light = (rank + file) % 2 == 1
-            bg       = _LIGHT_SQUARE if is_light else _DARK_SQUARE
-            symbol   = (
-                _PIECE_SYMBOLS.get((piece.piece_type, piece.color), "?")
-                if piece else " "
-            )
-            row += f"{bg} {symbol}{_RESET}"
-        row += f" {_BOLD}{rank + 1}{_RESET}"
+            square = chess.square(file, rank)
+            piece  = board.piece_at(square)
+            letter = _PIECE_LETTERS.get((piece.piece_type, piece.color), ".") if piece else "."
+            cells.append(f" {letter} ")
+        row = f"{rank + 1} |" + "|".join(cells) + "|"
         lines.append(row)
+        lines.append(border)
 
-    lines.append(f"{_BOLD}{file_labels}{_RESET}\n")
+    file_label = "    " + "   ".join(file_chars)
+    lines.append(file_label)
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -206,29 +210,34 @@ def play_game(
         if board.turn == human_colour:
             while True:
                 try:
-                    raw = input("  Your move: ").strip().lower()
+                    raw = input("  Your move: ").strip()
                 except (EOFError, KeyboardInterrupt):
                     print("\n  Interrupted — exiting.")
                     return
 
-                if raw == "quit":
+                # Commands are checked case-insensitively.
+                # The move itself is kept in its original case because SAN
+                # is case-sensitive: 'Nc3' != 'nc3'.
+                cmd = raw.lower()
+
+                if cmd == "quit":
                     print("  Goodbye!")
                     sys.exit(0)
 
-                if raw == "resign":
+                if cmd == "resign":
                     print(f"\n  You resigned.  The model wins.")
                     return
 
-                if raw == "draw":
+                if cmd == "draw":
                     print(f"\n  Draw claimed.  Game over.")
                     return
 
-                if raw == "moves":
+                if cmd == "moves":
                     legal_sans = sorted(board.san(m) for m in board.legal_moves)
                     print(f"  Legal moves ({len(legal_sans)}): {', '.join(legal_sans)}")
                     continue
 
-                if raw == "undo":
+                if cmd == "undo":
                     if len(history) < 2:
                         print("  Nothing to undo yet.")
                         continue
@@ -237,7 +246,7 @@ def play_game(
                     print("  Last two half-moves undone.")
                     break   # re-print the board
 
-                move = parse_move(raw, board)
+                move = parse_move(raw, board)   # raw preserves original case
                 if move is None:
                     print(f"  '{raw}' is not a valid or legal move — try again.")
                     continue

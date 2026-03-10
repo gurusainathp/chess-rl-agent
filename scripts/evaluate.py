@@ -9,21 +9,21 @@ printing a full result summary to the console.
 Usage
 -----
     # Evaluate a specific checkpoint
-    python scripts/evaluate.py --model data/models/policy_epoch_0050.pt
+    python scripts/evaluate.py --model models/policy_epoch_0050.pt
 
     # Use more games for a more reliable estimate
-    python scripts/evaluate.py --model data/models/policy_epoch_0050.pt --games 200
+    python scripts/evaluate.py --model models/policy_epoch_0050.pt --games 200
 
     # Save results to a JSON file
-    python scripts/evaluate.py --model data/models/policy_epoch_0050.pt \\
+    python scripts/evaluate.py --model models/policy_epoch_0050.pt \\
         --save-path data/eval/epoch_50_results.json
 
     # Show per-game output
-    python scripts/evaluate.py --model data/models/policy_epoch_0050.pt --verbose
+    python scripts/evaluate.py --model models/policy_epoch_0050.pt --verbose
 
     # Compare multiple checkpoints quickly
     for epoch in 10 20 30 40 50; do
-        python scripts/evaluate.py --model data/models/policy_epoch_00${epoch}.pt
+        python scripts/evaluate.py --model models/policy_epoch_00${epoch}.pt
     done
 """
 

@@ -20,21 +20,21 @@ Usage
     python scripts/train.py --epochs 100 --games-per-epoch 30 --lr 5e-4
 
     # Resume from a checkpoint
-    python scripts/train.py --resume data/models/policy_epoch_0010.pt
+    python scripts/train.py --resume models/policy_epoch_0010.pt
 
     # Evaluate every 5 epochs, save checkpoints every 10
     python scripts/train.py --eval-every 5 --checkpoint-every 10
 
-    # Full example
+    # Full example (recommended overnight run)
     python scripts/train.py \\
-        --epochs 50            \\
-        --games-per-epoch 20   \\
+        --epochs 150           \\
+        --games-per-epoch 60   \\
         --lr 1e-3              \\
         --eval-games 50        \\
         --eval-every 5         \\
         --checkpoint-every 10  \\
-        --checkpoint-dir data/models \\
-        --max-moves 200        \\
+        --checkpoint-dir models \\
+        --max-moves 60         \\
         --device cpu
 """
 
@@ -62,6 +62,7 @@ from src.training.train_policy import (
     EpochMetrics,
 )
 from src.evaluation.evaluate_model import evaluate, EvaluationConfig
+from src.training.pgn_writer import records_to_pgn, save_pgn
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Adam learning rate.")
 
     # Self-play
-    p.add_argument("--max-moves",        type=int,   default=200,
+    p.add_argument("--max-moves",        type=int,   default=60,
                    help="Move cap per self-play game (capped games = draw).")
     p.add_argument("--temp-high",        type=float, default=1.0,
                    help="Sampling temperature for early-game moves.")
@@ -142,7 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Half-move number at which temperature drops.")
 
     # Checkpointing
-    p.add_argument("--checkpoint-dir",   type=str,   default="data/models",
+    p.add_argument("--checkpoint-dir",   type=str,   default="models",
                    help="Directory to save model checkpoints.")
     p.add_argument("--checkpoint-every", type=int,   default=10,
                    help="Save a checkpoint every N epochs (0 = never).")
@@ -160,6 +161,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Torch device ('cpu' or 'cuda').")
     p.add_argument("--log-dir",          type=str,   default="logs",
                    help="Directory to write training log files.")
+    p.add_argument("--pgn-dir",          type=str,   default=None,
+                   help="If set, save self-play games as PGN to this directory every epoch.")
+    p.add_argument("--pgn-every",        type=int,   default=10,
+                   help="Save PGN every N epochs (only used when --pgn-dir is set).")
 
     return p
 
@@ -272,6 +277,7 @@ def main() -> None:
     log.info(f"  Eval every      : {args.eval_every} epochs")
     log.info(f"  Eval games      : {args.eval_games}")
     log.info(f"  Device          : {args.device}")
+    log.info(f"  PGN dir         : {args.pgn_dir or '(disabled)'}")
     log.info(f"{'='*60}")
 
     # ── Model ─────────────────────────────────────────────────────────
@@ -318,6 +324,12 @@ def main() -> None:
             )
             path = save_checkpoint(model, epoch, m, args.checkpoint_dir)
             log.info(f"  Checkpoint saved  : {path}")
+
+        # ── PGN saving ────────────────────────────────────────────────
+        if args.pgn_dir and args.pgn_every > 0 and epoch % args.pgn_every == 0:
+            pgn_text = records_to_pgn(records, epoch=epoch)
+            pgn_path = save_pgn(pgn_text, epoch=epoch, pgn_dir=args.pgn_dir)
+            log.info(f"  PGN saved         : {pgn_path}")
 
         # ── Evaluation ────────────────────────────────────────────────
         run_eval = False
