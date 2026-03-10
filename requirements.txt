@@ -29,6 +29,8 @@ tqdm                  # Progress bars for training loops and self-play episodes
 # User Interface
 # ------------------------------------------------------------
 streamlit             # Interactive web UI — play against the AI in the browser
+flask                 # Lightweight web framework for custom dashboards
+flask-cors             # Handle Cross-Origin Resource Sharing for web UI
 
 # ------------------------------------------------------------
 # Engine Evaluation

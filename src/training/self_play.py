@@ -3,53 +3,97 @@ self_play.py
 ------------
 Generates training data by running the policy network against itself.
 
-Each call to run_game() plays one complete game and returns a GameRecord
-containing every (board_tensor, legal_moves, chosen_move_index) triple,
-plus the final game result used to assign uniform rewards.
+Key behaviours
+--------------
+• En passant — python-chess handles it natively; `board.legal_moves` always
+  includes legal en-passant captures, so no special code is needed.
 
-Design decisions
-----------------
-- Same model plays both sides — the network learns from both White and
-  Black perspectives simultaneously, which is the standard AlphaZero
-  approach and avoids maintaining two separate model copies at this stage.
+• Draw detection (applied every half-move, before the move cap):
+    - Stalemate
+    - Insufficient material
+    - 50-move rule  (halfmove clock ≥ 100 half-moves)
+    - Threefold repetition
+  All of these terminate the game immediately with reward 0.
 
-- Temperature scheduling — high temperature (1.0) early in the game
-  encourages exploration; lower temperature (0.1) in the endgame (after
-  move threshold) focuses on exploitation once the position is clearer.
+• Move cap  — if the game is still running after `max_moves` half-moves,
+  it is sent to Stockfish for evaluation.  Stockfish returns a centipawn
+  score from White's perspective.  If |score| >= STOCKFISH_WIN_THRESHOLD
+  (default 100 cp = 1.0 pawn) the winning side gets +1.0 and the losing
+  side -1.0; otherwise both sides get 0.0 (draw).
+  If Stockfish is not installed or evaluation fails, the capped game is
+  treated as a draw (safe fallback).
 
-- Uniform reward — every move in a winning game gets +1, every move in
-  a losing game gets -1, every move in a draw gets 0.  Simple and stable
-  for early training.
-
-- max_moves cap — prevents games from running indefinitely during early
-  training when the model plays randomly.  Capped games are scored as draws.
-
-Usage
------
-    from src.models.policy_network import PolicyNetwork
-    from src.training.self_play import run_game, run_games
-
-    model = PolicyNetwork()
-
-    # Single game
-    record = run_game(model)
-    print(f"Moves: {len(record)}, Result: {record.result}")
-
-    # Batch of games
-    records = run_games(model, n_games=10)
-    dataset = [sample for record in records for sample in record]
+• All game-ending rules that python-chess enforces (checkmate, 75-move rule,
+  fivefold repetition) are also caught — they happen naturally via
+  `board.is_game_over()`.
 """
 
 from __future__ import annotations
 
 import chess
+import chess.engine
 import torch
+import os
+import shutil
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
 from src.environment.chess_env import ChessEnv
 from src.environment.board_encoder import encode_board
 from src.models.policy_network import PolicyNetwork
+
+
+# ---------------------------------------------------------------------------
+# Stockfish config
+# ---------------------------------------------------------------------------
+
+# Centipawn threshold for declaring a winner at move-cap.
+# 100 cp = 1 pawn advantage = "decisive" for our purposes.
+STOCKFISH_WIN_THRESHOLD_CP: int = 100
+
+# Time limit (seconds) given to Stockfish per position at move-cap.
+STOCKFISH_TIME_LIMIT: float = 0.1
+
+def _find_stockfish() -> str | None:
+    """Return the path to the Stockfish binary, or None if not found."""
+    # Check common environment variable first
+    env_path = os.environ.get("STOCKFISH_PATH")
+    if env_path and os.path.isfile(env_path):
+        return env_path
+    # Fall back to PATH lookup
+    return shutil.which("stockfish")
+
+
+def _stockfish_evaluate(fen: str) -> float | None:
+    """
+    Run Stockfish on the given FEN and return the score from White's POV
+    in centipawns, or None if Stockfish is unavailable or fails.
+
+    Returns
+    -------
+    float | None
+        Centipawn score (positive = White winning, negative = Black winning).
+        Mate scores are clamped to ±100_000.
+        None if Stockfish is not available or evaluation raises an exception.
+    """
+    sf_path = _find_stockfish()
+    if sf_path is None:
+        return None
+
+    try:
+        with chess.engine.SimpleEngine.popen_uci(sf_path) as engine:
+            board  = chess.Board(fen)
+            result = engine.analyse(
+                board,
+                chess.engine.Limit(time=STOCKFISH_TIME_LIMIT),
+            )
+            score = result["score"].white()   # PovScore from White's POV
+            if score.is_mate():
+                # Mate in N — treat as decisive
+                return 100_000.0 if score.mate() > 0 else -100_000.0
+            return float(score.score())       # centipawns
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -62,17 +106,10 @@ class GameSample(NamedTuple):
 
     Fields
     ------
-    board_tensor : torch.Tensor
-        Shape (13, 8, 8) — board state BEFORE the move was played.
-    legal_moves : list[chess.Move]
-        All legal moves available in this position.
-    move_index : int
-        Index into legal_moves of the move that was chosen.
-    reward : float
-        Uniform game reward assigned after the game ends:
-          +1.0 for the side that won
-          -1.0 for the side that lost
-           0.0 for a draw or capped game
+    board_tensor : torch.Tensor  shape (13, 8, 8) — board state BEFORE move.
+    legal_moves  : list[chess.Move]
+    move_index   : int            index into legal_moves of the chosen move.
+    reward       : float          assigned after game ends.
     """
     board_tensor : torch.Tensor
     legal_moves  : list
@@ -85,57 +122,62 @@ class GameRecord:
     """
     Complete record of one self-play game.
 
-    Attributes
-    ----------
-    samples : list[GameSample]
-        Ordered list of all samples produced during this game.
-    result : str
-        One of: 'white_wins', 'black_wins', 'draw', 'max_moves_reached'.
-    n_moves : int
-        Total number of half-moves (plies) played.
+    result values
+    -------------
+    'white_wins'        — checkmate
+    'black_wins'        — checkmate
+    'draw'              — stalemate / repetition / 50-move / insufficient material
+    'max_moves_reached' — hit move cap; Stockfish used for reward assignment
+    'max_moves_draw'    — hit cap, Stockfish says roughly equal
     """
     samples  : list[GameSample] = field(default_factory=list)
     result   : str              = "in_progress"
     n_moves  : int              = 0
+    stockfish_cp: float | None  = None   # set when Stockfish was consulted
 
-    def __len__(self) -> int:
-        return len(self.samples)
+    def __len__(self)  -> int: return len(self.samples)
+    def __iter__(self):        return iter(self.samples)
 
-    def __iter__(self):
-        return iter(self.samples)
-
-    def white_samples(self) -> list[GameSample]:
-        """Return samples from White's moves only (even indices: 0, 2, 4…)."""
-        return self.samples[::2]
-
-    def black_samples(self) -> list[GameSample]:
-        """Return samples from Black's moves only (odd indices: 1, 3, 5…)."""
-        return self.samples[1::2]
+    def white_samples(self) -> list[GameSample]: return self.samples[::2]
+    def black_samples(self) -> list[GameSample]: return self.samples[1::2]
 
 
 # ---------------------------------------------------------------------------
 # Temperature schedule
 # ---------------------------------------------------------------------------
 
-def get_temperature(move_number: int, temp_high: float, temp_low: float, threshold: int) -> float:
-    """
-    Return the sampling temperature for a given move number.
-
-    Before `threshold` moves: return temp_high (exploration).
-    At or after `threshold`  : return temp_low  (exploitation).
-
-    Parameters
-    ----------
-    move_number : int   Current half-move number (0-indexed).
-    temp_high   : float Temperature for early game (default 1.0).
-    temp_low    : float Temperature for late game  (default 0.1).
-    threshold   : int   Move number at which to switch to temp_low.
-
-    Returns
-    -------
-    float
-    """
+def get_temperature(
+    move_number : int,
+    temp_high   : float,
+    temp_low    : float,
+    threshold   : int,
+) -> float:
+    """Return sampling temperature based on move number."""
     return temp_high if move_number < threshold else temp_low
+
+
+# ---------------------------------------------------------------------------
+# Early-draw detection
+# ---------------------------------------------------------------------------
+
+def _is_early_draw(board: chess.Board) -> bool:
+    """
+    Return True if the position is a draw by any rule that python-chess can
+    detect *before* the move cap.
+
+    Covers:
+      • Stalemate
+      • Insufficient material
+      • 50-move rule   (halfmove_clock >= 100 means 50 full moves without
+                        pawn move or capture — python-chess uses half-moves)
+      • Threefold repetition
+    """
+    return (
+        board.is_stalemate()
+        or board.is_insufficient_material()
+        or board.is_fifty_moves()          # halfmove clock ≥ 100
+        or board.is_repetition(count=3)    # threefold repetition
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -143,193 +185,191 @@ def get_temperature(move_number: int, temp_high: float, temp_low: float, thresho
 # ---------------------------------------------------------------------------
 
 def run_game(
-    model       : PolicyNetwork,
-    max_moves   : int   = 200,
-    temp_high   : float = 1.0,
-    temp_low    : float = 0.1,
-    temp_threshold: int = 30,
-    device      : str   = "cpu",
+    model          : PolicyNetwork,
+    max_moves      : int   = 200,
+    temp_high      : float = 1.0,
+    temp_low       : float = 0.1,
+    temp_threshold : int   = 30,
+    device         : str   = "cpu",
+    use_stockfish  : bool  = True,
 ) -> GameRecord:
     """
     Play one complete self-play game and return a GameRecord.
 
-    The same model plays both sides.  Moves are sampled from the softmax
-    policy distribution with temperature scheduling.
+    En passant
+    ----------
+    Fully supported — python-chess includes legal en-passant captures in
+    `board.legal_moves` automatically, so no special handling is needed.
+
+    Move cap + Stockfish
+    --------------------
+    If the game reaches `max_moves` half-moves without a decisive result,
+    Stockfish evaluates the final position.  If the score exceeds
+    STOCKFISH_WIN_THRESHOLD_CP centipawns the winning side is awarded +1.0
+    and the losing side -1.0.  Otherwise both sides receive 0.0 (draw).
+    If Stockfish is unavailable the capped game is treated as 0.0 / draw.
 
     Parameters
     ----------
-    model : PolicyNetwork
-        The policy network — used in eval mode, weights are not modified.
-    max_moves : int
-        Maximum number of half-moves before the game is declared a draw.
-        Prevents infinite games during early training (default: 200).
-    temp_high : float
-        Sampling temperature before temp_threshold moves (default: 1.0).
-    temp_low : float
-        Sampling temperature at and after temp_threshold moves (default: 0.1).
-    temp_threshold : int
-        Half-move number at which temperature drops to temp_low (default: 30).
-    device : str
-        Torch device to run inference on (default: 'cpu').
+    model          : PolicyNetwork
+    max_moves      : int    Half-move cap (default 200).
+    temp_high      : float  Temperature for first `temp_threshold` moves.
+    temp_low       : float  Temperature after `temp_threshold` moves.
+    temp_threshold : int    Half-move number to switch temperature.
+    device         : str    Torch device.
+    use_stockfish  : bool   If False, skip Stockfish and treat cap as draw.
 
     Returns
     -------
     GameRecord
-        Contains all GameSamples and the final result string.
     """
     model.eval()
     env    = ChessEnv()
     record = GameRecord()
     env.reset()
 
-    # Collect raw samples (without reward — assigned after game ends)
+    # raw_samples: list of (board_tensor, legal_moves, move_index, white_to_move)
     raw_samples: list[tuple[torch.Tensor, list, int, bool]] = []
-    # Each entry: (board_tensor, legal_moves, move_index, white_to_move)
 
     for move_number in range(max_moves):
 
+        # ── Check for natural game end ──────────────────────────────────
         if env.is_game_over():
+            break
+
+        # ── Check for early draw (repetition / 50-move / stalemate / material) ──
+        if _is_early_draw(env.board):
             break
 
         legal = env.get_legal_moves()
         if not legal:
             break
 
-        # Encode current board state
-        state_np  = encode_board(env.board)                            # (13, 8, 8)
-        state_t   = torch.tensor(state_np, dtype=torch.float32, device=device)
-        input_t   = state_t.unsqueeze(0)                               # (1, 13, 8, 8)
+        # ── Encode state ────────────────────────────────────────────────
+        state_np = encode_board(env.board)                         # (13,8,8)
+        state_t  = torch.tensor(state_np, dtype=torch.float32, device=device)
+        input_t  = state_t.unsqueeze(0)                            # (1,13,8,8)
 
-        # Determine temperature for this move
+        # ── Temperature ─────────────────────────────────────────────────
         temp = get_temperature(move_number, temp_high, temp_low, temp_threshold)
 
-        # Sample a move from the policy
+        # ── Sample move ──────────────────────────────────────────────────
         with torch.no_grad():
             chosen_move = model.select_move(input_t, legal, temperature=temp)
 
-        # Record whose turn it is BEFORE applying the move
         white_to_move = (env.board.turn == chess.WHITE)
-
-        # Find the index of the chosen move in legal_moves
-        move_index = legal.index(chosen_move)
-
-        # Store raw sample (reward assigned later)
+        move_index    = legal.index(chosen_move)
         raw_samples.append((state_t, legal, move_index, white_to_move))
 
-        # Apply move to environment
+        # ── Apply move (en passant handled automatically by python-chess) ──
         env.step(chosen_move)
 
-    # ------------------------------------------------------------------
-    # Determine game result and assign uniform rewards
-    # ------------------------------------------------------------------
-    result = env.get_game_result()
+    # -----------------------------------------------------------------------
+    # Determine outcome and assign rewards
+    # -----------------------------------------------------------------------
 
     if env.is_game_over():
-        outcome = env.get_game_result()
+        # Natural end: checkmate or draw by 75-move / fivefold / insufficient
+        outcome      = env.get_game_result()   # 'white_wins' | 'black_wins' | 'draw'
+        result_label = outcome
+        stockfish_cp = None
+
+    elif _is_early_draw(env.board):
+        # Draw detected by early-draw check (repetition, 50-move, stalemate)
+        outcome      = "draw"
+        result_label = "draw"
+        stockfish_cp = None
+
     else:
-        outcome = "draw"   # max_moves reached → treat as draw
+        # ── Move cap reached ── ask Stockfish ──────────────────────────
+        result_label = "max_moves_reached"
+        stockfish_cp = None
 
-    result_label = outcome if env.is_game_over() else "max_moves_reached"
+        if use_stockfish:
+            stockfish_cp = _stockfish_evaluate(env.board.fen())
 
-    # Map result to per-side reward
-    # white_reward is the reward for the White side;
-    # Black gets the opposite.
+        if stockfish_cp is not None:
+            if stockfish_cp >= STOCKFISH_WIN_THRESHOLD_CP:
+                outcome = "white_wins"        # White is decisively ahead
+            elif stockfish_cp <= -STOCKFISH_WIN_THRESHOLD_CP:
+                outcome = "black_wins"        # Black is decisively ahead
+            else:
+                outcome = "draw"              # roughly equal at cap
+                result_label = "max_moves_draw"
+        else:
+            # Stockfish unavailable → treat cap as draw
+            outcome      = "draw"
+            result_label = "max_moves_draw"
+
+    # Map outcome → per-side reward
     if outcome == "white_wins":
-        white_reward =  1.0
-        black_reward = -1.0
+        white_reward, black_reward =  1.0, -1.0
     elif outcome == "black_wins":
-        white_reward = -1.0
-        black_reward =  1.0
+        white_reward, black_reward = -1.0,  1.0
     else:
-        white_reward =  0.0
-        black_reward =  0.0
+        white_reward, black_reward =  0.0,  0.0
 
-    # Assemble final GameSamples with rewards
+    # Assemble GameSamples
     for (board_tensor, legal_moves, move_index, white_to_move) in raw_samples:
         reward = white_reward if white_to_move else black_reward
-        record.samples.append(
-            GameSample(
-                board_tensor=board_tensor,
-                legal_moves=legal_moves,
-                move_index=move_index,
-                reward=reward,
-            )
-        )
+        record.samples.append(GameSample(
+            board_tensor=board_tensor,
+            legal_moves=legal_moves,
+            move_index=move_index,
+            reward=reward,
+        ))
 
-    record.result  = result_label
-    record.n_moves = len(raw_samples)
-
+    record.result       = result_label
+    record.n_moves      = len(raw_samples)
+    record.stockfish_cp = stockfish_cp
     return record
 
 
 # ---------------------------------------------------------------------------
-# Convenience: batch of games
+# Batch runner
 # ---------------------------------------------------------------------------
 
 def run_games(
-    model     : PolicyNetwork,
-    n_games   : int   = 10,
-    max_moves : int   = 200,
-    temp_high : float = 1.0,
-    temp_low  : float = 0.1,
-    temp_threshold: int = 30,
-    device    : str   = "cpu",
-    verbose   : bool  = False,
+    model          : PolicyNetwork,
+    n_games        : int   = 10,
+    max_moves      : int   = 200,
+    temp_high      : float = 1.0,
+    temp_low       : float = 0.1,
+    temp_threshold : int   = 30,
+    device         : str   = "cpu",
+    use_stockfish  : bool  = True,
+    verbose        : bool  = False,
 ) -> list[GameRecord]:
-    """
-    Run multiple self-play games and return all GameRecords.
-
-    Parameters
-    ----------
-    model     : PolicyNetwork
-    n_games   : int   Number of games to play (default: 10).
-    max_moves : int   Per-game move cap (default: 200).
-    temp_high : float Early-game temperature (default: 1.0).
-    temp_low  : float Late-game temperature  (default: 0.1).
-    temp_threshold : int  Move number to switch temperature (default: 30).
-    device    : str   Torch device (default: 'cpu').
-    verbose   : bool  Print a summary line per game if True.
-
-    Returns
-    -------
-    list[GameRecord]
-    """
+    """Run multiple self-play games and return all GameRecords."""
     records = []
     for i in range(n_games):
         record = run_game(
             model,
-            max_moves=max_moves,
-            temp_high=temp_high,
-            temp_low=temp_low,
-            temp_threshold=temp_threshold,
-            device=device,
+            max_moves      = max_moves,
+            temp_high      = temp_high,
+            temp_low       = temp_low,
+            temp_threshold = temp_threshold,
+            device         = device,
+            use_stockfish  = use_stockfish,
         )
         records.append(record)
         if verbose:
+            sf_str = (
+                f"  sf={record.stockfish_cp:+.0f}cp"
+                if record.stockfish_cp is not None else ""
+            )
             print(
-                f"  Game {i + 1:>3}/{n_games} | "
+                f"  Game {i+1:>3}/{n_games} | "
                 f"Moves: {record.n_moves:>3} | "
-                f"Result: {record.result}"
+                f"Result: {record.result}{sf_str}"
             )
     return records
 
 
 # ---------------------------------------------------------------------------
-# Convenience: flatten records into a flat sample list
+# Flatten
 # ---------------------------------------------------------------------------
 
 def records_to_dataset(records: list[GameRecord]) -> list[GameSample]:
-    """
-    Flatten a list of GameRecords into a single list of GameSamples.
-
-    Useful for feeding directly into a training loop.
-
-    Parameters
-    ----------
-    records : list[GameRecord]
-
-    Returns
-    -------
-    list[GameSample]
-    """
+    """Flatten a list of GameRecords into a single list of GameSamples."""
     return [sample for record in records for sample in record]

@@ -156,6 +156,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--eval-every",       type=int,   default=5,
                    help="Run evaluation every N epochs (0 = never, -1 = end only).")
 
+    # Stockfish
+    p.add_argument("--no-stockfish",     action="store_true",
+                   help="Disable Stockfish evaluation at move cap (cap = draw).")
+
     # Hardware
     p.add_argument("--device",           type=str,   default="cpu",
                    help="Torch device ('cpu' or 'cuda').")
@@ -180,16 +184,17 @@ def print_epoch_header(epoch: int, total: int, log: logging.Logger) -> None:
 
 
 def print_self_play_summary(records: list, samples: list, log: logging.Logger) -> None:
-    wins   = sum(1 for r in records if r.result == "white_wins")
-    losses = sum(1 for r in records if r.result == "black_wins")
-    draws  = sum(1 for r in records if r.result == "draw")
-    capped = sum(1 for r in records if r.result == "max_moves_reached")
-    avg_len = (
-        sum(r.n_moves for r in records) / len(records) if records else 0.0
-    )
+    wins      = sum(1 for r in records if r.result == "white_wins")
+    losses    = sum(1 for r in records if r.result == "black_wins")
+    draws     = sum(1 for r in records if r.result == "draw")
+    cap_dec   = sum(1 for r in records if r.result == "max_moves_reached")   # cap + decisive SF
+    cap_draw  = sum(1 for r in records if r.result == "max_moves_draw")       # cap + equal SF
+    sf_used   = sum(1 for r in records if r.stockfish_cp is not None)
+    avg_len   = sum(r.n_moves for r in records) / len(records) if records else 0.0
     log.info(f"  Self-play games   : {len(records)}")
     log.info(f"  Samples collected : {len(samples)}")
-    log.info(f"  Game outcomes     : W {wins} / L {losses} / D {draws} / Cap {capped}")
+    log.info(f"  Outcomes          : W {wins} / L {losses} / D {draws} / Cap-decisive {cap_dec} / Cap-draw {cap_draw}")
+    log.info(f"  Stockfish evals   : {sf_used}")
     log.info(f"  Avg game length   : {avg_len:.1f} half-moves")
 
 
@@ -237,6 +242,7 @@ def run_epoch(
         temp_low       = config.temp_low,
         temp_threshold = config.temp_threshold,
         device         = config.device,
+        use_stockfish  = not getattr(config, "no_stockfish", False),
     )
     samples = records_to_dataset(records)
 
@@ -277,6 +283,7 @@ def main() -> None:
     log.info(f"  Eval every      : {args.eval_every} epochs")
     log.info(f"  Eval games      : {args.eval_games}")
     log.info(f"  Device          : {args.device}")
+    log.info(f"  Stockfish       : {'disabled (--no-stockfish)' if args.no_stockfish else 'enabled (at move cap)'}")
     log.info(f"  PGN dir         : {args.pgn_dir or '(disabled)'}")
     log.info(f"{'='*60}")
 
@@ -314,7 +321,7 @@ def main() -> None:
             # Build a minimal EpochMetrics for the checkpoint metadata
             wins   = sum(1 for r in records if r.result == "white_wins")
             losses = sum(1 for r in records if r.result == "black_wins")
-            draws  = sum(1 for r in records if r.result in ("draw", "max_moves_reached"))
+            draws  = sum(1 for r in records if r.result in ("draw", "max_moves_reached", "max_moves_draw"))
             m = EpochMetrics(
                 epoch=epoch, loss=loss.item(),
                 n_samples=len(samples), n_games=len(records),
