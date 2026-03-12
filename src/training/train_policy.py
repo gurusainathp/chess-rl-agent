@@ -59,6 +59,7 @@ import torch.nn.functional as F
 
 from src.models.policy_network import PolicyNetwork
 from src.training.self_play import run_games, records_to_dataset, GameSample
+from src.opponents.opponent_pool import OpponentPool
 
 
 # ---------------------------------------------------------------------------
@@ -91,10 +92,20 @@ class TrainingConfig:
     temp_high        : float = 1.0
     temp_low         : float = 0.1
     temp_threshold   : int   = 30
+    entropy_coeff    : float = 0.01   # λ for entropy regularisation
     checkpoint_dir   : str   = "data/models"
     checkpoint_every : int   = 10
     device           : str   = "cpu"
     verbose          : bool  = False
+    # ------------------------------------------------------------------
+    # Opponent pool
+    # ------------------------------------------------------------------
+    use_opponent_pool      : bool  = True
+    pool_size              : int   = 5
+    pool_weight_self       : float = 0.60
+    pool_weight_checkpoint : float = 0.20
+    pool_weight_random     : float = 0.10
+    pool_weight_stockfish  : float = 0.10
 
 
 # ---------------------------------------------------------------------------
@@ -290,14 +301,32 @@ def train(
     print(f"  Epochs          : {config.n_epochs}")
     print(f"  Games / epoch   : {config.games_per_epoch}")
     print(f"  Learning rate   : {config.learning_rate}")
+    print(f"  Entropy coeff   : {config.entropy_coeff}")
+    print(f"  Opponent pool   : {'enabled' if config.use_opponent_pool else 'disabled'}")
     print(f"  Device          : {config.device}")
     print(f"{'='*60}\n")
+
+    # Build opponent pool
+    pool: OpponentPool | None = None
+    if config.use_opponent_pool:
+        pool = OpponentPool(
+            checkpoint_dir = config.checkpoint_dir,
+            pool_size      = config.pool_size,
+            weights        = {
+                "self"       : config.pool_weight_self,
+                "checkpoint" : config.pool_weight_checkpoint,
+                "random"     : config.pool_weight_random,
+                "stockfish"  : config.pool_weight_stockfish,
+            },
+            device         = config.device,
+        )
+        print(f"  {pool.summary()}\n")
 
     for epoch in range(1, config.n_epochs + 1):
         epoch_start = time.time()
 
         # ------------------------------------------------------------------
-        # 1. Generate self-play games
+        # 1. Generate games (self-play or opponent pool)
         # ------------------------------------------------------------------
         model.eval()
         records = run_games(
@@ -309,6 +338,7 @@ def train(
             temp_threshold = config.temp_threshold,
             device         = config.device,
             verbose        = config.verbose,
+            opponent_pool  = pool,
         )
 
         # Tally game outcomes
@@ -332,11 +362,12 @@ def train(
         model.train()
         optimiser.zero_grad()
 
-        loss = compute_loss(model, samples, device=config.device)
+        loss = compute_loss(
+            model, samples,
+            device        = config.device,
+            entropy_coeff = config.entropy_coeff,
+        )
 
-        # Guard: if every sample had reward=0 (all draws / capped games),
-        # compute_loss returns a plain zero scalar — no grad_fn attached.
-        # Calling .backward() on it raises RuntimeError, so skip the update.
         if loss.requires_grad:
             loss.backward()
             optimiser.step()
@@ -360,11 +391,14 @@ def train(
         print(metrics.summary())
 
         # ------------------------------------------------------------------
-        # 5. Save checkpoint
+        # 5. Save checkpoint + refresh pool with the new checkpoint
         # ------------------------------------------------------------------
         if config.checkpoint_every > 0 and epoch % config.checkpoint_every == 0:
             path = save_checkpoint(model, epoch, metrics, config.checkpoint_dir)
             print(f"  → Checkpoint saved: {path}")
+            if pool is not None:
+                pool.refresh_checkpoints()
+                print(f"  → {pool.summary()}")
 
     print(f"\nTraining complete. Total epochs: {len(history)}")
     return model, history

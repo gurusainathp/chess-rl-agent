@@ -56,12 +56,24 @@ STOCKFISH_TIME_LIMIT: float = 0.1
 
 def _find_stockfish() -> str | None:
     """Return the path to the Stockfish binary, or None if not found."""
-    # Check common environment variable first
+    # Check explicit environment variable first
     env_path = os.environ.get("STOCKFISH_PATH")
     if env_path and os.path.isfile(env_path):
         return env_path
     # Fall back to PATH lookup
     return shutil.which("stockfish")
+
+
+# Log once at import time so the very first line of training output confirms
+# whether Stockfish is available.  No-op if it isn't — capped games simply
+# fall back to draws (safe path in _stockfish_evaluate).
+_SF_PATH: str | None = _find_stockfish()
+if _SF_PATH:
+    print(f"[self_play] Stockfish found: {_SF_PATH}")
+else:
+    print("[self_play] Stockfish not found — capped games will be scored as draws. "
+          "Install via 'sudo apt install stockfish' (Linux) or 'brew install stockfish' (macOS), "
+          "or set the STOCKFISH_PATH environment variable.")
 
 
 def _stockfish_evaluate(fen: str) -> float | None:
@@ -76,7 +88,7 @@ def _stockfish_evaluate(fen: str) -> float | None:
         Mate scores are clamped to ±100_000.
         None if Stockfish is not available or evaluation raises an exception.
     """
-    sf_path = _find_stockfish()
+    sf_path = _SF_PATH
     if sf_path is None:
         return None
 
