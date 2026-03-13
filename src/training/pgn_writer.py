@@ -95,17 +95,27 @@ def _record_to_game(
     pgn_result   = _RESULT_TO_PGN.get(record.result, "*")
     termination  = _RESULT_TO_TERMINATION.get(record.result, "Unknown")
 
+    # Resolve opponent label from the record's opponent_type tag
+    opp_type = getattr(record, "opponent_type", "self")
+    if opp_type == "self":
+        event_label = f"Self-Play Epoch {epoch}"
+        black_tag   = black_label
+    else:
+        event_label = f"vs {opp_type} Epoch {epoch}"
+        black_tag   = opp_type   # e.g. "RandomAgent" or "CheckpointAgent"
+
     # PGN headers
-    game.headers["Event"]       = f"Self-Play Epoch {epoch}"
-    game.headers["Site"]        = "Chess RL Agent"
-    game.headers["Date"]        = today
-    game.headers["Round"]       = str(game_number)
-    game.headers["White"]       = white_label
-    game.headers["Black"]       = black_label
-    game.headers["Result"]      = pgn_result
-    game.headers["Termination"] = termination
-    game.headers["WhiteElo"]    = "?"
-    game.headers["BlackElo"]    = "?"
+    game.headers["Event"]        = event_label
+    game.headers["Site"]         = "Chess RL Agent"
+    game.headers["Date"]         = today
+    game.headers["Round"]        = str(game_number)
+    game.headers["White"]        = white_label
+    game.headers["Black"]        = black_tag
+    game.headers["Result"]       = pgn_result
+    game.headers["Termination"]  = termination
+    game.headers["OpponentType"] = opp_type
+    game.headers["WhiteElo"]     = "?"
+    game.headers["BlackElo"]     = "?"
 
     # Replay moves from samples
     board = chess.Board()

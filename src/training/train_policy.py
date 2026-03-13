@@ -48,13 +48,13 @@ Or import directly:
 
 from __future__ import annotations
 
+import logging
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from datetime import datetime
 
-import chess
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.policy_network import PolicyNetwork
@@ -93,8 +93,14 @@ class TrainingConfig:
     temp_low         : float = 0.1
     temp_threshold   : int   = 30
     entropy_coeff    : float = 0.01   # λ for entropy regularisation
-    checkpoint_dir   : str   = "data/models"
+    checkpoint_dir   : str   = "models"
     checkpoint_every : int   = 10
+    log_dir          : str   = "logs"  # directory for timestamped .log files
+    use_stockfish    : bool  = True
+    eval_games       : int   = 50
+    eval_every       : int   = 10     # 0=never, -1=end only
+    pgn_dir          : str | None = None
+    pgn_every        : int   = 10
     device           : str   = "cpu"
     verbose          : bool  = False
     # ------------------------------------------------------------------
@@ -145,61 +151,121 @@ class EpochMetrics:
 # ---------------------------------------------------------------------------
 
 def compute_loss(
-    model   : PolicyNetwork,
-    samples : list[GameSample],
-    device  : str = "cpu",
+    model         : PolicyNetwork,
+    samples       : list[GameSample],
+    device        : str   = "cpu",
+    entropy_coeff : float = 0.01,
 ) -> torch.Tensor:
     """
-    Compute reward-weighted cross-entropy loss over a list of GameSamples.
+    Compute reward-weighted REINFORCE loss with entropy regularisation.
 
-    For each sample:
-      - Forward pass produces logits over legal moves.
-      - Cross-entropy loss is computed against the chosen move index.
-      - Loss is scaled by |reward| and negated for losing moves.
+    REINFORCE objective: maximise  E[log π(a|s) * R]
+    As a minimisation loss:        -log π(a|s) * R  =  CE * R
 
-    Samples with reward = 0 (draws) contribute nothing to the gradient.
+    Sign convention
+    ---------------
+    CE loss is always positive.  Multiplying by reward gives:
+      Win  (+1): positive → gradient *lowers* CE → raises prob of winning move ✓
+      Loss (-1): negative → gradient *raises* CE → lowers prob of losing move  ✓
+      Draw ( 0): zero     → no gradient signal                                  ✓
+
+    Critically: wins and losses do NOT cancel — wins minimise (push prob up),
+    losses effectively maximise their CE term (push prob down).  Averaging
+    over non-zero samples normalises scale without sign cancellation.
+
+    Entropy regularisation
+    ----------------------
+    -entropy_coeff * H(π)  is subtracted from the loss to encourage
+    exploration.  Maximising entropy == minimising its negative.
 
     Parameters
     ----------
-    model   : PolicyNetwork  (must be in train mode)
-    samples : list[GameSample]
-    device  : str
+    model         : PolicyNetwork  (must be in train mode)
+    samples       : list[GameSample]
+    device        : str
+    entropy_coeff : float  Weight on entropy bonus (default 0.01)
 
     Returns
     -------
     torch.Tensor  — scalar loss, ready for .backward()
+                    requires_grad=False when all rewards are zero (all draws)
     """
-    # Zero-dim scalar so the final shape is () not (1,).
-    # requires_grad=False here is intentional — grad_fn is attached the
-    # moment we add a ce_loss (which does have a grad_fn) to it.
-    weighted_loss = torch.zeros((), device=device)
+    policy_loss   = torch.zeros((), device=device)
+    entropy_sum   = torch.zeros((), device=device)
+    n_policy      = 0   # non-zero reward samples
+    n_entropy     = 0   # all samples (entropy computed over everything)
 
     for sample in samples:
-        # Skip samples with zero reward — they provide no learning signal
-        if sample.reward == 0.0:
-            continue
-
-        # Prepare inputs
         board_t = sample.board_tensor.unsqueeze(0).to(device)   # (1, 13, 8, 8)
+        logits  = model(board_t, sample.legal_moves)             # (1, N_legal)
+        log_probs = F.log_softmax(logits, dim=-1)                # (1, N_legal)
+        probs     = log_probs.exp()
+
+        # Entropy of this position's distribution
+        entropy_sum = entropy_sum - (probs * log_probs).sum()
+        n_entropy  += 1
+
+        if sample.reward == 0.0:
+            continue   # no REINFORCE signal for draws
+
         target  = torch.tensor([sample.move_index], dtype=torch.long, device=device)
-
-        # Forward pass → logits (1, num_legal_moves)
-        logits = model(board_t, sample.legal_moves)
-
-        # Per-sample cross-entropy loss
         ce_loss = F.cross_entropy(logits, target)
 
-        # Scale by reward:
-        #   Win  (+1): reinforce the chosen move   → add positive loss
-        #   Loss (-1): suppress the chosen move    → negate loss (push away)
-        weighted_loss = weighted_loss + ce_loss * sample.reward
+        # Correct REINFORCE: loss = CE * reward
+        #   reward=+1 → minimise CE → reinforce winning move
+        #   reward=-1 → negative term → gradient raises CE → suppresses losing move
+        policy_loss = policy_loss + ce_loss * sample.reward
+        n_policy   += 1
 
-    # Average over all non-zero-reward samples
-    n_contributing = sum(1 for s in samples if s.reward != 0.0)
-    if n_contributing > 0:
-        weighted_loss = weighted_loss / n_contributing
+    if n_policy > 0:
+        policy_loss = policy_loss / n_policy   # normalise
 
-    return weighted_loss
+    if n_entropy > 0:
+        entropy_sum = entropy_sum / n_entropy  # mean entropy
+
+    # Total loss: REINFORCE - entropy bonus
+    # (subtracting entropy because we *maximise* entropy, i.e. minimise -H)
+    total_loss = policy_loss - entropy_coeff * entropy_sum
+
+    return total_loss
+
+
+# ---------------------------------------------------------------------------
+# Logger helper
+# ---------------------------------------------------------------------------
+
+def setup_logger(log_dir: str) -> logging.Logger:
+    """
+    Configure a logger that writes to both console and a timestamped log file.
+
+    Console : plain message, INFO and above
+    File    : timestamp + level + message, DEBUG and above
+
+    Returns the 'chess_rl' logger.  Calling setup_logger() again (e.g. on
+    resume) clears existing handlers so duplicate lines are never written.
+    """
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+
+    logger = logging.getLogger("chess_rl")
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()   # avoid duplicates on re-runs / resume
+
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter("%(message)s"))
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    logger.info(f"Log file : {log_path}")
+    return logger
 
 
 # ---------------------------------------------------------------------------
@@ -267,46 +333,61 @@ def load_checkpoint(path: str, model: PolicyNetwork) -> int:
 # ---------------------------------------------------------------------------
 
 def train(
-    config : TrainingConfig | None = None,
-    model  : PolicyNetwork  | None = None,
+    config      : TrainingConfig | None = None,
+    model       : PolicyNetwork  | None = None,
+    start_epoch : int = 0,
 ) -> tuple[PolicyNetwork, list[EpochMetrics]]:
     """
     Run the full training loop.
 
     Parameters
     ----------
-    config : TrainingConfig
-        Hyperparameters.  Defaults to TrainingConfig() if not provided.
-    model : PolicyNetwork
-        Model to train.  A fresh PolicyNetwork() is created if not provided.
+    config      : TrainingConfig  Hyperparameters (defaults to TrainingConfig()).
+    model       : PolicyNetwork   Model to train (fresh one created if None).
+    start_epoch : int             Epoch to resume from (0 = fresh start).
+                                  Pass the value returned by load_checkpoint().
 
     Returns
     -------
     model   : PolicyNetwork      — trained model (weights updated in place).
     history : list[EpochMetrics] — one entry per epoch.
     """
+    from src.training.pgn_writer import records_to_pgn, save_pgn
+    from src.evaluation.evaluate_model import evaluate, EvaluationConfig
+
     if config is None:
         config = TrainingConfig()
     if model is None:
         model = PolicyNetwork()
 
+    # ── Logger ────────────────────────────────────────────────────────────
+    log = setup_logger(config.log_dir)
+
     model.to(config.device)
     optimiser = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 
     history: list[EpochMetrics] = []
+    train_start = time.time()
 
-    print(f"\n{'='*60}")
-    print(f"  Chess RL — Policy Network Training")
-    print(f"{'='*60}")
-    print(f"  Epochs          : {config.n_epochs}")
-    print(f"  Games / epoch   : {config.games_per_epoch}")
-    print(f"  Learning rate   : {config.learning_rate}")
-    print(f"  Entropy coeff   : {config.entropy_coeff}")
-    print(f"  Opponent pool   : {'enabled' if config.use_opponent_pool else 'disabled'}")
-    print(f"  Device          : {config.device}")
-    print(f"{'='*60}\n")
+    total_epochs = start_epoch + config.n_epochs
+    resume_str   = f" (resuming from epoch {start_epoch})" if start_epoch > 0 else ""
 
-    # Build opponent pool
+    log.info(f"\n{'='*60}")
+    log.info(f"  Chess RL — Policy Network Training{resume_str}")
+    log.info(f"{'='*60}")
+    log.info(f"  Epochs to run   : {config.n_epochs}  (up to epoch {total_epochs})")
+    log.info(f"  Games / epoch   : {config.games_per_epoch}")
+    log.info(f"  Learning rate   : {config.learning_rate}")
+    log.info(f"  Entropy coeff   : {config.entropy_coeff}")
+    log.info(f"  Max moves       : {config.max_moves}")
+    log.info(f"  Opponent pool   : {'enabled' if config.use_opponent_pool else 'disabled'}")
+    log.info(f"  Stockfish       : {'enabled' if config.use_stockfish else 'disabled'}")
+    log.info(f"  Checkpoint dir  : {config.checkpoint_dir}")
+    log.info(f"  Log dir         : {config.log_dir}")
+    log.info(f"  Device          : {config.device}")
+    log.info(f"{'='*60}\n")
+
+    # ── Opponent pool ────────────────────────────────────────────────────
     pool: OpponentPool | None = None
     if config.use_opponent_pool:
         pool = OpponentPool(
@@ -320,14 +401,17 @@ def train(
             },
             device         = config.device,
         )
-        print(f"  {pool.summary()}\n")
+        log.info(f"  {pool.summary()}\n")
 
-    for epoch in range(1, config.n_epochs + 1):
+    # ── Training loop ────────────────────────────────────────────────────
+    for epoch in range(start_epoch + 1, total_epochs + 1):
         epoch_start = time.time()
 
-        # ------------------------------------------------------------------
-        # 1. Generate games (self-play or opponent pool)
-        # ------------------------------------------------------------------
+        log.info(f"\n{'─'*60}")
+        log.info(f"  Epoch {epoch}/{total_epochs}")
+        log.info(f"{'─'*60}")
+
+        # 1. Generate games ------------------------------------------------
         model.eval()
         records = run_games(
             model,
@@ -337,31 +421,20 @@ def train(
             temp_low       = config.temp_low,
             temp_threshold = config.temp_threshold,
             device         = config.device,
+            use_stockfish  = config.use_stockfish,
             verbose        = config.verbose,
             opponent_pool  = pool,
         )
 
-        # Tally game outcomes
-        wins      = sum(1 for r in records if r.result == "white_wins")
-        losses    = sum(1 for r in records if r.result == "black_wins")
-        draws     = sum(1 for r in records if r.result == "draw")
-        max_hit   = sum(1 for r in records if r.result == "max_moves_reached")
-
-        # ------------------------------------------------------------------
-        # 2. Build flat dataset
-        # ------------------------------------------------------------------
+        # 2. Build flat dataset --------------------------------------------
         samples = records_to_dataset(records)
-
         if not samples:
-            print(f"Epoch {epoch}: no samples generated — skipping.")
+            log.info("  No samples generated — skipping epoch.")
             continue
 
-        # ------------------------------------------------------------------
-        # 3. Compute loss and update weights
-        # ------------------------------------------------------------------
+        # 3. Compute loss and update --------------------------------------
         model.train()
         optimiser.zero_grad()
-
         loss = compute_loss(
             model, samples,
             device        = config.device,
@@ -371,10 +444,25 @@ def train(
         if loss.requires_grad:
             loss.backward()
             optimiser.step()
+            log.info(f"  Training loss     : {loss.item():.6f}")
+        else:
+            log.info("  Training loss     : 0.000000  (all draws — no update)")
 
-        # ------------------------------------------------------------------
-        # 4. Record metrics
-        # ------------------------------------------------------------------
+        # 4. Record metrics -----------------------------------------------
+        wins    = sum(1 for r in records if r.result == "white_wins")
+        losses  = sum(1 for r in records if r.result == "black_wins")
+        draws   = sum(1 for r in records if r.result == "draw")
+        cap_dec = sum(1 for r in records if r.result == "max_moves_reached")
+        cap_drw = sum(1 for r in records if r.result == "max_moves_draw")
+        sf_used = sum(1 for r in records if r.stockfish_cp is not None)
+        avg_len = sum(r.n_moves for r in records) / len(records)
+
+        log.info(f"  Self-play games   : {len(records)}")
+        log.info(f"  Samples collected : {len(samples)}")
+        log.info(f"  Outcomes          : W {wins} / L {losses} / D {draws} / Cap-decisive {cap_dec} / Cap-draw {cap_drw}")
+        log.info(f"  Stockfish evals   : {sf_used}")
+        log.info(f"  Avg game length   : {avg_len:.1f} half-moves")
+
         duration = time.time() - epoch_start
         metrics  = EpochMetrics(
             epoch         = epoch,
@@ -384,21 +472,54 @@ def train(
             wins          = wins,
             losses        = losses,
             draws         = draws,
-            max_moves_hit = max_hit,
+            max_moves_hit = cap_dec + cap_drw,
             duration_sec  = duration,
         )
         history.append(metrics)
-        print(metrics.summary())
+        log.info(metrics.summary())
 
-        # ------------------------------------------------------------------
-        # 5. Save checkpoint + refresh pool with the new checkpoint
-        # ------------------------------------------------------------------
+        # 5. Checkpoint + pool refresh ------------------------------------
         if config.checkpoint_every > 0 and epoch % config.checkpoint_every == 0:
             path = save_checkpoint(model, epoch, metrics, config.checkpoint_dir)
-            print(f"  → Checkpoint saved: {path}")
+            log.info(f"  → Checkpoint saved: {path}")
             if pool is not None:
                 pool.refresh_checkpoints()
-                print(f"  → {pool.summary()}")
+                log.info(f"  → {pool.summary()}")
 
-    print(f"\nTraining complete. Total epochs: {len(history)}")
+        # 6. PGN saving ---------------------------------------------------
+        if (config.pgn_dir and config.pgn_every > 0
+                and epoch % config.pgn_every == 0):
+            pgn_text = records_to_pgn(records, epoch=epoch)
+            pgn_path = save_pgn(pgn_text, epoch=epoch, pgn_dir=config.pgn_dir)
+            log.info(f"  → PGN saved: {pgn_path}")
+
+        # 7. Evaluation vs random agent -----------------------------------
+        run_eval = (
+            (config.eval_every > 0 and epoch % config.eval_every == 0)
+            or (config.eval_every == -1 and epoch == total_epochs)
+        )
+        if run_eval and config.eval_games > 0:
+            eval_cfg = EvaluationConfig(
+                n_games     = config.eval_games,
+                max_moves   = config.max_moves,
+                temperature = config.temp_low,
+                device      = config.device,
+            )
+            result = evaluate(model, eval_cfg)
+            log.info(
+                f"  Evaluation        : "
+                f"W {result.wins} / L {result.losses} / "
+                f"D {result.draws + result.max_moves_games}"
+                f"  →  Winrate {result.winrate * 100:.1f}%"
+            )
+
+        log.info(f"  Epoch time        : {duration:.1f}s")
+
+    total_time = time.time() - train_start
+    log.info(f"\n{'='*60}")
+    log.info(f"  Training complete")
+    log.info(f"  Total time      : {total_time:.1f}s  ({total_time/60:.1f} min)")
+    log.info(f"  Epochs trained  : {len(history)}")
+    log.info(f"{'='*60}\n")
+
     return model, history
