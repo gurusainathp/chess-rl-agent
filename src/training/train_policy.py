@@ -60,6 +60,7 @@ import torch.nn.functional as F
 from src.models.policy_network import PolicyNetwork
 from src.training.self_play import run_games, records_to_dataset, GameSample
 from src.opponents.opponent_pool import OpponentPool
+from src.training.replay_buffer import ReplayBuffer
 
 
 # ---------------------------------------------------------------------------
@@ -89,10 +90,10 @@ class TrainingConfig:
     games_per_epoch  : int   = 20
     learning_rate    : float = 1e-3
     max_moves        : int   = 200
-    temp_high        : float = 1.0
+    temp_high        : float = 1.2   # lead recommends 1.2 for first N moves
     temp_low         : float = 0.1
     temp_threshold   : int   = 30
-    entropy_coeff    : float = 0.01   # λ for entropy regularisation
+    entropy_coeff    : float = 0.02   # lead recommends 0.02 to prevent collapse
     checkpoint_dir   : str   = "models"
     checkpoint_every : int   = 10
     log_dir          : str   = "logs"  # directory for timestamped .log files
@@ -108,10 +109,29 @@ class TrainingConfig:
     # ------------------------------------------------------------------
     use_opponent_pool      : bool  = True
     pool_size              : int   = 5
-    pool_weight_self       : float = 0.60
-    pool_weight_checkpoint : float = 0.20
-    pool_weight_random     : float = 0.10
-    pool_weight_stockfish  : float = 0.10
+    pool_weight_self       : float = 0.40   # hard max 40% self-play
+    pool_weight_stockfish  : float = 0.30   # depth-8; checkpoint folds here if unavailable
+    pool_weight_checkpoint : float = 0.20   # past selves
+    pool_weight_random     : float = 0.10   # random; stockfish folds here if unavailable
+    # ------------------------------------------------------------------
+    # Replay buffer  (Phase 6)
+    # ------------------------------------------------------------------
+    use_replay_buffer  : bool  = True
+    replay_capacity    : int   = 100_000  # max positions stored
+    replay_batch_size  : int   = 2_048    # positions sampled per training step
+    # ------------------------------------------------------------------
+    # Opening randomization  (Phase 7)
+    # ------------------------------------------------------------------
+    opening_moves      : int   = 4     # random half-moves at game start (0=off)
+    opening_prob       : float = 0.5   # fraction of games that use it
+    # ------------------------------------------------------------------
+    # Extended evaluation tiers  (Phase 9)
+    # ------------------------------------------------------------------
+    eval_vs_checkpoint_games : int        = 0     # 0 = skip; auto-set to latest ckpt
+    eval_vs_checkpoint_path  : str | None = None
+    eval_vs_stockfish_games  : int        = 0     # 0 = skip
+    eval_stockfish_depth     : int        = 8
+    eval_log_path            : str | None = None  # e.g. "logs/eval_results.json"
 
 
 # ---------------------------------------------------------------------------
@@ -132,16 +152,10 @@ class EpochMetrics:
     duration_sec   : float
 
     def summary(self) -> str:
-        w = self.wins
-        l = self.losses
-        d = self.draws
-        m = self.max_moves_hit
-        g = self.n_games
         return (
-            f"Epoch {self.epoch:>3} | "
-            f"Loss: {self.loss:.4f} | "
+            f"  Epoch {self.epoch:>3} | "
+            f"Loss: {self.loss:.6f} | "
             f"Samples: {self.n_samples:>5} | "
-            f"W/L/D/Cap: {w}/{l}/{d}/{m} of {g} | "
             f"Time: {self.duration_sec:.1f}s"
         )
 
@@ -154,7 +168,7 @@ def compute_loss(
     model         : PolicyNetwork,
     samples       : list[GameSample],
     device        : str   = "cpu",
-    entropy_coeff : float = 0.01,
+    entropy_coeff : float = 0.02,   # matches TrainingConfig default
 ) -> torch.Tensor:
     """
     Compute reward-weighted REINFORCE loss with entropy regularisation.
@@ -165,13 +179,13 @@ def compute_loss(
     Sign convention
     ---------------
     CE loss is always positive.  Multiplying by reward gives:
-      Win  (+1): positive → gradient *lowers* CE → raises prob of winning move ✓
-      Loss (-1): negative → gradient *raises* CE → lowers prob of losing move  ✓
-      Draw ( 0): zero     → no gradient signal                                  ✓
+      Win  (+2): large positive  → strongly reinforce winning move        ✓
+      Draw (-1): small negative  → mildly suppress passive/drawing moves  ✓
+      Loss (-2): large negative  → strongly suppress losing moves         ✓
 
-    Critically: wins and losses do NOT cancel — wins minimise (push prob up),
-    losses effectively maximise their CE term (push prob down).  Averaging
-    over non-zero samples normalises scale without sign cancellation.
+    Reward schedule  Win=+2.0  Draw=-1.0  Loss=-2.0
+    Draws carry a penalty to discourage passive play and ensure every game
+    produces a gradient signal (previously draws = 0 = no learning).
 
     Entropy regularisation
     ----------------------
@@ -183,7 +197,7 @@ def compute_loss(
     model         : PolicyNetwork  (must be in train mode)
     samples       : list[GameSample]
     device        : str
-    entropy_coeff : float  Weight on entropy bonus (default 0.01)
+    entropy_coeff : float  Weight on entropy bonus (default 0.02)
 
     Returns
     -------
@@ -205,15 +219,17 @@ def compute_loss(
         entropy_sum = entropy_sum - (probs * log_probs).sum()
         n_entropy  += 1
 
+        # Reward schedule: Win=+2.0  Draw=-1.0  Loss=-2.0
+        # All non-zero rewards contribute a gradient signal.
+        # reward=+2 → strongly reinforce winning moves
+        # reward=-1 → mildly suppress draw moves (discourage passivity)
+        # reward=-2 → strongly suppress losing moves
         if sample.reward == 0.0:
-            continue   # no REINFORCE signal for draws
+            continue   # truly zero reward — no signal (should not occur with new schedule)
 
         target  = torch.tensor([sample.move_index], dtype=torch.long, device=device)
         ce_loss = F.cross_entropy(logits, target)
 
-        # Correct REINFORCE: loss = CE * reward
-        #   reward=+1 → minimise CE → reinforce winning move
-        #   reward=-1 → negative term → gradient raises CE → suppresses losing move
         policy_loss = policy_loss + ce_loss * sample.reward
         n_policy   += 1
 
@@ -328,6 +344,11 @@ def load_checkpoint(path: str, model: PolicyNetwork) -> int:
     return checkpoint["epoch"]
 
 
+
+# ---------------------------------------------------------------------------
+# Per-epoch result table
+# ---------------------------------------------------------------------------
+
 # ---------------------------------------------------------------------------
 # Main training loop
 # ---------------------------------------------------------------------------
@@ -353,7 +374,7 @@ def train(
     history : list[EpochMetrics] — one entry per epoch.
     """
     from src.training.pgn_writer import records_to_pgn, save_pgn
-    from src.evaluation.evaluate_model import evaluate, EvaluationConfig
+    from src.evaluation.evaluate_model import evaluate_full, EvaluationConfig
 
     if config is None:
         config = TrainingConfig()
@@ -372,36 +393,100 @@ def train(
     total_epochs = start_epoch + config.n_epochs
     resume_str   = f" (resuming from epoch {start_epoch})" if start_epoch > 0 else ""
 
-    log.info(f"\n{'='*60}")
+    W = 62  # banner width
+
+    log.info("=" * W)
     log.info(f"  Chess RL — Policy Network Training{resume_str}")
-    log.info(f"{'='*60}")
-    log.info(f"  Epochs to run   : {config.n_epochs}  (up to epoch {total_epochs})")
-    log.info(f"  Games / epoch   : {config.games_per_epoch}")
-    log.info(f"  Learning rate   : {config.learning_rate}")
-    log.info(f"  Entropy coeff   : {config.entropy_coeff}")
-    log.info(f"  Max moves       : {config.max_moves}")
-    log.info(f"  Opponent pool   : {'enabled' if config.use_opponent_pool else 'disabled'}")
-    log.info(f"  Stockfish       : {'enabled' if config.use_stockfish else 'disabled'}")
-    log.info(f"  Checkpoint dir  : {config.checkpoint_dir}")
-    log.info(f"  Log dir         : {config.log_dir}")
-    log.info(f"  Device          : {config.device}")
-    log.info(f"{'='*60}\n")
+    log.info("=" * W)
+
+    # ── General ───────────────────────────────────────────────────────
+    log.info("  GENERAL")
+    log.info(f"    device              : {config.device}")
+    log.info(f"    epochs to run       : {config.n_epochs}  (up to epoch {total_epochs})")
+    log.info(f"    games / epoch       : {config.games_per_epoch}")
+    log.info(f"    log dir             : {config.log_dir}")
+    log.info(f"    checkpoint dir      : {config.checkpoint_dir}")
+    log.info(f"    checkpoint every    : {config.checkpoint_every} epochs")
+
+    # ── Training / loss ───────────────────────────────────────────────
+    log.info("  TRAINING")
+    log.info(f"    learning rate       : {config.learning_rate}")
+    log.info(f"    entropy coeff       : {config.entropy_coeff}  (>0 encourages exploration)")
+    log.info( "    reward schedule     : Win=+2.0  Draw=-1.0  Loss=-2.0")
+
+    # ── Temperature (Phase 1) ─────────────────────────────────────────
+    log.info("  TEMPERATURE  (Phase 1)")
+    log.info(f"    temp high           : {config.temp_high}  (moves 0–{config.temp_threshold-1})")
+    log.info(f"    temp low            : {config.temp_low}  (moves {config.temp_threshold}+)")
+    log.info(f"    temp threshold      : {config.temp_threshold} half-moves")
+    log.info(f"    max moves / game    : {config.max_moves}")
+
+    # ── Replay buffer (Phase 6) ───────────────────────────────────────
+    log.info("  REPLAY BUFFER  (Phase 6)")
+    log.info(f"    enabled             : {config.use_replay_buffer}")
+    if config.use_replay_buffer:
+        log.info(f"    capacity            : {config.replay_capacity:,} positions")
+        log.info(f"    batch size          : {config.replay_batch_size:,} positions / step")
+
+    # ── Opening randomisation (Phase 7) ──────────────────────────────
+    log.info("  OPENING RANDOMISATION  (Phase 7)")
+    log.info(f"    opening moves       : {config.opening_moves}  (0 = disabled)")
+    log.info(f"    opening prob        : {config.opening_prob*100:.0f}% of games randomised")
+
+    # ── Stockfish (Phase 8) ───────────────────────────────────────────
+    log.info("  STOCKFISH  (Phase 8)")
+    log.info(f"    use stockfish       : {config.use_stockfish}  (move-cap adjudication)")
+    log.info(f"    stockfish depth     : {config.eval_stockfish_depth}  (pool opponent + eval)")
+
+    # ── Opponent pool (Phases 3-5) ────────────────────────────────────
+    log.info("  OPPONENT POOL  (Phases 3-5)")
+    log.info(f"    enabled             : {config.use_opponent_pool}")
+    if config.use_opponent_pool:
+        log.info(f"    pool size           : {config.pool_size} max checkpoints")
+        log.info(f"    weight self-play    : {config.pool_weight_self*100:.0f}%")
+        log.info(f"    weight checkpoint   : {config.pool_weight_checkpoint*100:.0f}%")
+        log.info(f"    weight random       : {config.pool_weight_random*100:.0f}%")
+        log.info(f"    weight stockfish    : {config.pool_weight_stockfish*100:.0f}%  (falls back to random if unavailable)")
+
+    # ── Evaluation (Phase 9) ──────────────────────────────────────────
+    log.info("  EVALUATION  (Phase 9)")
+    log.info(f"    eval every          : {config.eval_every} epochs  (0=never, -1=end only)")
+    log.info(f"    vs random games     : {config.eval_games}")
+    log.info(f"    vs checkpoint games : {config.eval_vs_checkpoint_games}  (0 = skip)")
+    log.info(f"    vs stockfish games  : {config.eval_vs_stockfish_games}  (0 = skip)")
+    log.info(f"    eval log path       : {config.eval_log_path or '(not set)'}")
+
+    # ── PGN ───────────────────────────────────────────────────────────
+    log.info("  PGN")
+    log.info(f"    pgn dir             : {config.pgn_dir or '(disabled)'}")
+    if config.pgn_dir:
+        log.info(f"    pgn every           : {config.pgn_every} epochs")
+
+    log.info("=" * W)
+    log.info("")
 
     # ── Opponent pool ────────────────────────────────────────────────────
     pool: OpponentPool | None = None
     if config.use_opponent_pool:
         pool = OpponentPool(
-            checkpoint_dir = config.checkpoint_dir,
-            pool_size      = config.pool_size,
-            weights        = {
+            checkpoint_dir   = config.checkpoint_dir,
+            pool_size        = config.pool_size,
+            weights          = {
                 "self"       : config.pool_weight_self,
                 "checkpoint" : config.pool_weight_checkpoint,
                 "random"     : config.pool_weight_random,
                 "stockfish"  : config.pool_weight_stockfish,
             },
-            device         = config.device,
+            stockfish_depth  = config.eval_stockfish_depth,
+            device           = config.device,
         )
         log.info(f"  {pool.summary()}\n")
+
+    # ── Replay buffer ─────────────────────────────────────────────────────
+    replay: ReplayBuffer | None = None
+    if config.use_replay_buffer:
+        replay = ReplayBuffer(capacity=config.replay_capacity)
+        log.info(f"  {replay.summary()}\n")
 
     # ── Training loop ────────────────────────────────────────────────────
     for epoch in range(start_epoch + 1, total_epochs + 1):
@@ -424,13 +509,24 @@ def train(
             use_stockfish  = config.use_stockfish,
             verbose        = config.verbose,
             opponent_pool  = pool,
+            opening_moves  = config.opening_moves,   # Phase 7
+            opening_prob   = config.opening_prob,
         )
 
-        # 2. Build flat dataset --------------------------------------------
-        samples = records_to_dataset(records)
-        if not samples:
+        # 2. Build flat dataset + feed replay buffer ----------------------
+        new_samples = records_to_dataset(records)
+        if not new_samples:
             log.info("  No samples generated — skipping epoch.")
             continue
+
+        if replay is not None:
+            replay.add(new_samples)
+            # Draw a mixed batch of old + new positions for training.
+            # Fall back to new_samples only until buffer has content.
+            samples = replay.sample(config.replay_batch_size)
+            log.info(f"  {replay.summary()}")
+        else:
+            samples = new_samples
 
         # 3. Compute loss and update --------------------------------------
         model.train()
@@ -458,10 +554,12 @@ def train(
         avg_len = sum(r.n_moves for r in records) / len(records)
 
         log.info(f"  Self-play games   : {len(records)}")
-        log.info(f"  Samples collected : {len(samples)}")
-        log.info(f"  Outcomes          : W {wins} / L {losses} / D {draws} / Cap-decisive {cap_dec} / Cap-draw {cap_drw}")
+        log.info(f"  New samples       : {len(new_samples)}")
+        log.info(f"  Training batch    : {len(samples)}"
+                 + (" (from replay)" if replay is not None else ""))
         log.info(f"  Stockfish evals   : {sf_used}")
         log.info(f"  Avg game length   : {avg_len:.1f} half-moves")
+
 
         duration = time.time() - epoch_start
         metrics  = EpochMetrics(
@@ -493,21 +591,37 @@ def train(
             pgn_path = save_pgn(pgn_text, epoch=epoch, pgn_dir=config.pgn_dir)
             log.info(f"  → PGN saved: {pgn_path}")
 
-        # 7. Evaluation vs random agent -----------------------------------
+        # 7. Multi-tier evaluation (Phase 9) ------------------------------
         run_eval = (
             (config.eval_every > 0 and epoch % config.eval_every == 0)
             or (config.eval_every == -1 and epoch == total_epochs)
         )
         if run_eval and config.eval_games > 0:
+            # Auto-set checkpoint path to the most recent saved checkpoint
+            # so tier 2 always compares vs the last saved model.
+            ckpt_path = config.eval_vs_checkpoint_path
+            if ckpt_path is None and config.eval_vs_checkpoint_games > 0:
+                import glob
+                ckpts = sorted(glob.glob(
+                    os.path.join(config.checkpoint_dir, "policy_epoch_*.pt")
+                ))
+                ckpt_path = ckpts[-1] if ckpts else None
+
             eval_cfg = EvaluationConfig(
-                n_games     = config.eval_games,
-                max_moves   = config.max_moves,
-                temperature = config.temp_low,
-                device      = config.device,
+                vs_random_games          = config.eval_games,
+                max_moves                = config.max_moves,
+                temperature              = config.temp_low,
+                device                   = config.device,
+                vs_checkpoint_games      = config.eval_vs_checkpoint_games,
+                vs_checkpoint_path       = ckpt_path,
+                vs_stockfish_games       = config.eval_vs_stockfish_games,
+                stockfish_depth          = config.eval_stockfish_depth,
+                eval_log_path            = config.eval_log_path,
             )
-            result = evaluate(model, eval_cfg)
+            result = evaluate_full(model, eval_cfg, epoch=epoch)
+            # Log a one-line summary; full detail already printed by evaluate_full
             log.info(
-                f"  Evaluation        : "
+                f"  Eval vs Random    : "
                 f"W {result.wins} / L {result.losses} / "
                 f"D {result.draws + result.max_moves_games}"
                 f"  →  Winrate {result.winrate * 100:.1f}%"

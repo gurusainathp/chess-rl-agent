@@ -3,109 +3,70 @@ src/opponents/opponent_pool.py
 -------------------------------
 Weighted sampler over a pool of chess opponents.
 
-Why this matters
-----------------
-Pure self-play has a well-known failure mode: the model finds a local
-equilibrium — a set of opening lines and responses — and stops exploring.
-Both sides reinforce the same patterns, gradients collapse, and training
-stalls.  The opponent pool breaks this by introducing diverse pressure:
+Opponent slots
+--------------
+  self        (60%) — pure self-play; no opponent object
+  checkpoint  (20%) — frozen past-self snapshots; builds a curriculum
+  random      (10%) — RandomAgent; exposes the model to chaotic positions
+  stockfish   (10%) — depth-limited StockfishAgent; punishes tactical errors
+                      Falls back to RandomAgent if Stockfish is unavailable.
 
-  • RandomAgent        (10%) — forces the model to handle unfamiliar
-                               positions it would never reach in self-play.
-  • CheckpointAgents   (20%) — stable, non-updating targets from earlier
-                               training.  The model must improve enough to
-                               beat its past self.
-  • Self-play          (60%) — keeps the primary signal intact.  The model
-                               still learns primarily from itself.
-  • Stockfish          (10%) — reserved for later; wired in as a no-op slot
-                               today so the interface never changes.
+The pool is constructed once at training start and updated every time a
+checkpoint is saved via refresh_checkpoints().
 
-Default weights
----------------
-    OpponentPool.DEFAULT_WEIGHTS = {
-        "self"       : 0.60,
-        "checkpoint" : 0.20,
-        "random"     : 0.10,
-        "stockfish"  : 0.10,   # falls back to random if SF not available
-    }
-
-Checkpoint management
----------------------
-Call pool.refresh_checkpoints() after each checkpoint save during training.
-The pool scans the checkpoint directory and keeps the N most recent files
-(default: pool_size=5) as CheckpointAgents.  If fewer than N checkpoints
-exist the checkpoint weight is redistributed proportionally to self-play
-so the ratios stay valid.
+Stockfish fallback
+------------------
+If the Stockfish binary is not found the 10% stockfish weight is
+transparently redistributed to the random slot.  A one-time warning is
+printed so the user knows.  No crash, no config change needed.
 
 Usage
 -----
-    pool = OpponentPool(
-        checkpoint_dir = "data/models",
-        pool_size      = 5,
-    )
+    pool = OpponentPool(checkpoint_dir="models", pool_size=5)
     pool.refresh_checkpoints()
-
-    opponent = pool.sample()     # returns None (self-play) or an agent
+    opponent = pool.sample()   # None = self-play, else an agent object
 """
 
 from __future__ import annotations
 
+import glob
 import os
 import random
-import glob
 from typing import Any
 
 from src.opponents.checkpoint_agent import CheckpointAgent
 from src.evaluation.random_agent    import RandomAgent
 
 
-# ---------------------------------------------------------------------------
-# Sentinel for "self-play" slot — no opponent object needed
-# ---------------------------------------------------------------------------
-
 _SELF_PLAY = None   # run_game treats opponent=None as pure self-play
 
 
 class OpponentPool:
     """
-    Weighted pool of opponents sampled each game.
+    Weighted pool of opponents sampled once per game.
 
     Parameters
     ----------
-    checkpoint_dir : str
-        Directory to scan for .pt checkpoint files.
-    pool_size      : int
-        Maximum number of CheckpointAgents to keep loaded (default 5).
-        Older checkpoints beyond this window are discarded from the pool.
-    weights        : dict[str, float] | None
-        Override default sampling weights.  Keys must include
-        'self', 'checkpoint', 'random', 'stockfish'.
-        Values are normalised automatically so they need not sum to 1.
-    random_seed    : int | None
-        Seed for the pool's internal RNG (useful for reproducible tests).
-    checkpoint_temperature : float
-        Temperature used by all CheckpointAgents (default 0.5).
-    device         : str
-        Torch device for CheckpointAgents (default 'cpu').
-
-    Methods
-    -------
-    refresh_checkpoints()
-        Scan checkpoint_dir and update the loaded CheckpointAgent list.
-        Call this after each checkpoint save during training.
-    sample() -> agent | None
-        Draw one opponent according to the pool weights.
-        Returns None to signal self-play.
-    summary() -> str
-        Human-readable description of the current pool state.
+    checkpoint_dir         : str    Directory scanned for .pt checkpoint files.
+    pool_size              : int    Max CheckpointAgents kept loaded (default 5).
+    weights                : dict   Sampling weights for each slot.
+                                    Keys: "self", "checkpoint", "random", "stockfish".
+                                    Normalised automatically.
+    random_seed            : int|None
+    checkpoint_temperature : float  Temperature for CheckpointAgent inference (default 0.5).
+    stockfish_depth        : int    UCI depth for StockfishAgent (default 5).
+    device                 : str    Torch device for checkpoint agents.
     """
 
     DEFAULT_WEIGHTS: dict[str, float] = {
-        "self"       : 0.60,
-        "checkpoint" : 0.20,
-        "random"     : 0.10,
-        "stockfish"  : 0.10,   # falls back to random until SF is wired in
+        "self"       : 0.40,   # max 40% self-play
+        "stockfish"  : 0.30,   # depth-8 Stockfish (falls back to random)
+        "checkpoint" : 0.20,   # past checkpoints (falls back to stockfish)
+        "random"     : 0.10,   # random agent
     }
+
+    # Hard cap: self-play never exceeds 40% regardless of fallbacks
+    SELF_PLAY_MAX: float = 0.40
 
     def __init__(
         self,
@@ -114,28 +75,61 @@ class OpponentPool:
         weights                  : dict  | None = None,
         random_seed              : int   | None = None,
         checkpoint_temperature   : float = 0.5,
+        stockfish_depth          : int   = 8,
         device                   : str   = "cpu",
     ):
         self.checkpoint_dir         = checkpoint_dir
         self.pool_size              = pool_size
         self.checkpoint_temperature = checkpoint_temperature
+        self.stockfish_depth        = stockfish_depth
         self.device                 = device
         self._rng                   = random.Random(random_seed)
 
-        # Merge caller weights with defaults
         raw = dict(self.DEFAULT_WEIGHTS)
         if weights:
             raw.update(weights)
         self._base_weights = raw
 
-        # RandomAgent reused across all games (stateless)
-        self._random_agent = RandomAgent()
+        # ── Agents ──────────────────────────────────────────────────────
+        self._random_agent  = RandomAgent()
+        self._stockfish_agent = None    # set in _init_stockfish()
+        self._sf_available  = False
+        self._sf_reason     = ""        # human-readable reason if unavailable
+        self._init_stockfish()
 
-        # CheckpointAgents — populated by refresh_checkpoints()
         self._checkpoint_agents: list[CheckpointAgent] = []
-
-        # Perform an initial scan so the pool is ready immediately
         self.refresh_checkpoints()
+
+    # ------------------------------------------------------------------
+    # Stockfish initialisation
+    # ------------------------------------------------------------------
+
+    def _init_stockfish(self) -> None:
+        """
+        Try to load StockfishAgent once at construction time.
+
+        Sets self._stockfish_agent and self._sf_available.
+        On failure, stockfish weight folds into random — printed once.
+        """
+        try:
+            from src.opponents.stockfish_agent import StockfishAgent, stockfish_available
+            if stockfish_available():
+                self._stockfish_agent = StockfishAgent(depth=self.stockfish_depth)
+                self._sf_available    = True
+                print(f"  [OpponentPool] Stockfish OK  "
+                      f"(depth={self.stockfish_depth})  "
+                      f"→ {self._base_weights.get('stockfish', 0.10)*100:.0f}% pool slot active")
+            else:
+                self._sf_available = False
+                self._sf_reason    = "binary not found (set STOCKFISH_PATH)"
+                print(f"  [OpponentPool] Stockfish unavailable — {self._sf_reason}\n"
+                      f"                 stockfish slot ({self._base_weights.get('stockfish',0.10)*100:.0f}%)"
+                      f" folded into random agent")
+        except ImportError as e:
+            self._sf_available = False
+            self._sf_reason    = f"import error: {e}"
+            print(f"  [OpponentPool] Stockfish unavailable — {self._sf_reason}\n"
+                  f"                 stockfish slot folded into random agent")
 
     # ------------------------------------------------------------------
     # Checkpoint management
@@ -143,29 +137,21 @@ class OpponentPool:
 
     def refresh_checkpoints(self) -> None:
         """
-        Scan checkpoint_dir for .pt files and (re)load the N most recent
-        as CheckpointAgents.
-
-        Safe to call at any point during training — existing agents whose
-        files are still in the newest-N set are kept as-is (not reloaded).
+        Scan checkpoint_dir and (re)load the N most recent as CheckpointAgents.
+        Safe to call after every checkpoint save during training.
         """
         if not os.path.isdir(self.checkpoint_dir):
             self._checkpoint_agents = []
             return
 
-        # Find all .pt files in the directory, sorted newest-first by name
-        # (epoch number is zero-padded in the filename so lexical sort works)
         pattern = os.path.join(self.checkpoint_dir, "policy_epoch_*.pt")
-        paths   = sorted(glob.glob(pattern), reverse=True)   # newest first
-        paths   = paths[:self.pool_size]                      # keep top N
+        paths   = sorted(glob.glob(pattern), reverse=True)[:self.pool_size]
 
-        # Build a set of paths already loaded to avoid redundant disk reads
         loaded_paths = {a.path for a in self._checkpoint_agents}
-
         new_agents: list[CheckpointAgent] = []
+
         for path in paths:
             if path in loaded_paths:
-                # Reuse the already-loaded agent
                 existing = next(a for a in self._checkpoint_agents if a.path == path)
                 new_agents.append(existing)
             else:
@@ -177,61 +163,89 @@ class OpponentPool:
                     )
                     new_agents.append(agent)
                 except Exception as exc:
-                    # Never crash training due to a corrupt checkpoint
                     print(f"  [OpponentPool] Warning: could not load {path}: {exc}")
 
         self._checkpoint_agents = new_agents
 
     # ------------------------------------------------------------------
-    # Sampling
+    # Effective weights
     # ------------------------------------------------------------------
 
     def _effective_weights(self) -> dict[str, float]:
         """
-        Compute the effective sampling weights given the current pool state.
+        Compute live sampling weights given current pool state.
 
-        If no checkpoints are loaded, the checkpoint weight is folded into
-        self-play so the distribution stays valid.
+        Fallback rules (applied in order):
+          1. If no checkpoints loaded → fold checkpoint weight into stockfish.
+          2. If Stockfish unavailable → fold stockfish weight into random.
+          3. Cap self-play at SELF_PLAY_MAX (40%) — excess goes to stockfish,
+             or random if stockfish is also unavailable.
+          4. Normalise so weights sum to 1.0.
         """
         w = dict(self._base_weights)
 
-        # Fold stockfish into random for now (not yet wired)
-        w["random"] += w.pop("stockfish", 0.0)
-
-        # If no checkpoints available, fold their weight into self-play
+        # Rule 1: No checkpoints → fold into stockfish (not self-play)
         if not self._checkpoint_agents:
-            w["self"] += w.pop("checkpoint", 0.0)
-        
-        # Normalise
-        total = sum(w.values())
+            w["stockfish"] = w.get("stockfish", 0.0) + w.pop("checkpoint", 0.0)
+
+        # Rule 2: Stockfish unavailable → fold into random
+        if not self._sf_available:
+            w["random"] = w.get("random", 0.0) + w.pop("stockfish", 0.0)
+
+        # Rule 3: Hard cap self-play at SELF_PLAY_MAX
+        overflow = w.get("self", 0.0) - self.SELF_PLAY_MAX
+        if overflow > 0:
+            w["self"] = self.SELF_PLAY_MAX
+            # Give overflow to stockfish if available, else random
+            if self._sf_available:
+                w["stockfish"] = w.get("stockfish", 0.0) + overflow
+            else:
+                w["random"] = w.get("random", 0.0) + overflow
+
+        # Rule 4: Normalise
+        total = sum(w.values()) or 1.0
         return {k: v / total for k, v in w.items()}
+
+    # ------------------------------------------------------------------
+    # Sampling
+    # ------------------------------------------------------------------
 
     def sample(self) -> Any:
         """
-        Sample one opponent according to the effective pool weights.
+        Sample one opponent according to effective weights.
 
         Returns
         -------
-        None                — signals pure self-play to run_game()
-        RandomAgent         — uniform random opponent
-        CheckpointAgent     — frozen snapshot of an earlier model
+        None            — self-play (run_game handles this)
+        RandomAgent     — uniform random opponent
+        CheckpointAgent — frozen past-self snapshot
+        StockfishAgent  — depth-limited engine (if available)
         """
         w = self._effective_weights()
 
-        # Build a weighted list for random.choices
         slots:   list[Any]   = []
         weights: list[float] = []
 
-        slots.append(_SELF_PLAY);          weights.append(w.get("self",       0.0))
-        slots.append(self._random_agent);  weights.append(w.get("random",     0.0))
+        # Self-play slot
+        slots.append(_SELF_PLAY)
+        weights.append(w.get("self", 0.0))
 
+        # Random slot (includes folded stockfish weight when SF unavailable)
+        slots.append(self._random_agent)
+        weights.append(w.get("random", 0.0))
+
+        # Checkpoint slot
         if self._checkpoint_agents:
-            # Pick one checkpoint agent uniformly at random for this slot
             cp_agent = self._rng.choice(self._checkpoint_agents)
-            slots.append(cp_agent);        weights.append(w.get("checkpoint", 0.0))
+            slots.append(cp_agent)
+            weights.append(w.get("checkpoint", 0.0))
 
-        chosen = self._rng.choices(slots, weights=weights, k=1)[0]
-        return chosen
+        # Stockfish slot (only added when actually available)
+        if self._sf_available and self._stockfish_agent is not None:
+            slots.append(self._stockfish_agent)
+            weights.append(w.get("stockfish", 0.0))
+
+        return self._rng.choices(slots, weights=weights, k=1)[0]
 
     # ------------------------------------------------------------------
     # Reporting
@@ -239,23 +253,32 @@ class OpponentPool:
 
     @property
     def n_checkpoints(self) -> int:
-        """Number of checkpoint agents currently loaded."""
         return len(self._checkpoint_agents)
 
     def summary(self) -> str:
         w = self._effective_weights()
-        cp_info = (
+
+        sf_str = (
+            f"depth={self.stockfish_depth}"
+            if self._sf_available
+            else f"UNAVAILABLE ({self._sf_reason}) → random"
+        )
+        cp_str = (
             f"{self.n_checkpoints} loaded "
             f"(epochs: {[a.epoch for a in self._checkpoint_agents]})"
-            if self._checkpoint_agents else "none loaded yet"
+            if self._checkpoint_agents
+            else "none yet — weight folded into self-play"
         )
+
         return (
-            f"OpponentPool | "
-            f"self={w.get('self',0)*100:.0f}%  "
-            f"checkpoint={w.get('checkpoint',0)*100:.0f}%  "
-            f"random={w.get('random',0)*100:.0f}% | "
-            f"Checkpoints: {cp_info}"
+            f"OpponentPool\n"
+            f"    self        {w.get('self',       0)*100:>5.1f}%\n"
+            f"    checkpoint  {w.get('checkpoint', 0)*100:>5.1f}%  {cp_str}\n"
+            f"    random      {w.get('random',     0)*100:>5.1f}%\n"
+            f"    stockfish   {w.get('stockfish',  0)*100:>5.1f}%  {sf_str}"
         )
 
     def __repr__(self) -> str:
-        return f"OpponentPool(n_checkpoints={self.n_checkpoints})"
+        return (f"OpponentPool("
+                f"n_checkpoints={self.n_checkpoints}, "
+                f"sf={'on' if self._sf_available else 'off'})")

@@ -19,9 +19,11 @@ Key behaviours
   it is sent to Stockfish for evaluation.  Stockfish returns a centipawn
   score from White's perspective.  If |score| >= STOCKFISH_WIN_THRESHOLD
   (default 100 cp = 1.0 pawn) the winning side gets +1.0 and the losing
-  side -1.0; otherwise both sides get 0.0 (draw).
+  side -1.0; otherwise both sides get draw reward (-1.0).
   If Stockfish is not installed or evaluation fails, the capped game is
   treated as a draw (safe fallback).
+
+Reward schedule: Win=+2.0  Draw=-1.0  Loss=-2.0
 
 • All game-ending rules that python-chess enforces (checkmate, 75-move rule,
   fivefold repetition) are also caught — they happen naturally via
@@ -51,8 +53,13 @@ from src.models.policy_network import PolicyNetwork
 # 100 cp = 1 pawn advantage = "decisive" for our purposes.
 STOCKFISH_WIN_THRESHOLD_CP: int = 100
 
-# Time limit (seconds) given to Stockfish per position at move-cap.
-STOCKFISH_TIME_LIMIT: float = 0.1
+# Search depth for Stockfish evaluation at move-cap and as an opponent.
+# depth=5 plays at solid club level (~1600 ELO) — weak enough that an
+# improving model can occasionally beat it, strong enough to give accurate
+# positional evaluations at the move cap.
+# Do NOT use Limit(time=...) — wall-clock speed varies by machine and can
+# accidentally run at full strength on fast hardware.
+STOCKFISH_DEPTH: int = 5
 
 def _find_stockfish() -> str | None:
     """Return the path to the Stockfish binary, or None if not found."""
@@ -71,17 +78,25 @@ else:
           "Set STOCKFISH_PATH env variable to your stockfish.exe path.")
 
 
-def _stockfish_evaluate(fen: str) -> float | None:
+def _stockfish_evaluate(fen: str, depth: int = STOCKFISH_DEPTH) -> float | None:
     """
     Run Stockfish on the given FEN and return the score from White's POV
     in centipawns, or None if Stockfish is unavailable or fails.
+
+    Uses depth-limited search (not time-limited) for deterministic,
+    machine-independent results.
+
+    Parameters
+    ----------
+    fen   : str  FEN string of the position to evaluate.
+    depth : int  UCI search depth (default STOCKFISH_DEPTH = 5).
 
     Returns
     -------
     float | None
         Centipawn score (positive = White winning, negative = Black winning).
         Mate scores are clamped to ±100_000.
-        None if Stockfish is not available or evaluation raises an exception.
+        None if Stockfish is unavailable or evaluation raises an exception.
     """
     sf_path = _SF_PATH
     if sf_path is None:
@@ -92,11 +107,10 @@ def _stockfish_evaluate(fen: str) -> float | None:
             board  = chess.Board(fen)
             result = engine.analyse(
                 board,
-                chess.engine.Limit(time=STOCKFISH_TIME_LIMIT),
+                chess.engine.Limit(depth=depth),
             )
             score = result["score"].white()   # PovScore from White's POV
             if score.is_mate():
-                # Mate in N — treat as decisive
                 return 100_000.0 if score.mate() > 0 else -100_000.0
             return float(score.score())       # centipawns
     except Exception:
@@ -139,9 +153,13 @@ class GameRecord:
     """
     samples       : list[GameSample] = field(default_factory=list)
     result        : str              = "in_progress"
+    # draw_reason: populated when result starts with "draw" or is a cap-draw
+    # values: "" | "stalemate" | "repetition" | "fifty_move" | "insufficient" | "cap_equal" | "checkmate_draw"
+    draw_reason   : str              = ""
     n_moves       : int              = 0
     stockfish_cp  : float | None     = None
-    opponent_type : str              = "self"  # "self" | "RandomAgent" | "CheckpointAgent"
+    opponent_type : str              = "self"   # "self" | "RandomAgent" | "CheckpointAgent"
+    model_color   : str              = "white"  # "white" | "black" | "both" (self-play)
 
     def __len__(self)  -> int: return len(self.samples)
     def __iter__(self):        return iter(self.samples)
@@ -168,24 +186,32 @@ def get_temperature(
 # Early-draw detection
 # ---------------------------------------------------------------------------
 
-def _is_early_draw(board: chess.Board) -> bool:
+def _get_draw_reason(board: chess.Board) -> str:
     """
-    Return True if the position is a draw by any rule that python-chess can
-    detect *before* the move cap.
+    Return a draw-reason string if the position is an early draw, else "".
 
-    Covers:
-      • Stalemate
-      • Insufficient material
-      • 50-move rule   (halfmove_clock >= 100 means 50 full moves without
-                        pawn move or capture — python-chess uses half-moves)
-      • Threefold repetition
+    Return values
+    -------------
+    ""              — not a draw
+    "stalemate"     — no legal moves, not in check
+    "repetition"    — threefold repetition
+    "fifty_move"    — 50-move rule (halfmove clock >= 100)
+    "insufficient"  — insufficient mating material
     """
-    return (
-        board.is_stalemate()
-        or board.is_insufficient_material()
-        or board.is_fifty_moves()          # halfmove clock ≥ 100
-        or board.is_repetition(count=3)    # threefold repetition
-    )
+    if board.is_stalemate():
+        return "stalemate"
+    if board.is_repetition(count=3):
+        return "repetition"
+    if board.is_fifty_moves():
+        return "fifty_move"
+    if board.is_insufficient_material():
+        return "insufficient"
+    return ""
+
+
+def _is_early_draw(board: chess.Board) -> bool:
+    """Return True if _get_draw_reason returns a non-empty string."""
+    return _get_draw_reason(board) != ""
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +228,8 @@ def run_game(
     temp_threshold : int   = 30,
     device         : str   = "cpu",
     use_stockfish  : bool  = True,
+    opening_moves  : int   = 0,
+    opening_prob   : float = 0.5,
 ) -> GameRecord:
     """
     Play one game and return a GameRecord of training samples.
@@ -209,49 +237,42 @@ def run_game(
     Opponent pool support
     ---------------------
     Pass any agent with a ``select_move(board) -> chess.Move`` interface as
-    ``opponent``.  When an opponent is supplied:
+    ``opponent``.  When an opponent is supplied only the model's moves are
+    stored as GameSamples, and rewards are assigned from the model's POV.
+    When ``opponent=None`` (default) the game is pure self-play.
 
-      • The training model plays as ``model_color`` (default White).
-      • The opponent plays the other colour.
-      • Only the model's moves are stored as GameSamples — the opponent's
-        moves are applied silently and never trained on.
-      • Rewards are assigned from the model's perspective:
-          model wins  →  all model samples get +1.0
-          model loses →  all model samples get -1.0
-          draw        →  all model samples get  0.0
+    Opening randomization  (Phase 7)
+    ---------------------------------
+    When ``opening_moves > 0`` and a random draw beats ``opening_prob``,
+    the first ``opening_moves`` half-moves are played randomly by both
+    sides before the model takes control.  These random moves are NOT
+    stored as training samples — they just set the starting position.
 
-    When ``opponent=None`` (default), the game is pure self-play: the model
-    plays both colours and samples from both sides are stored with per-side
-    rewards (same behaviour as before).
+    This prevents opening collapse (the model always playing the same
+    first few moves) and exposes it to a much wider variety of positions.
 
-    En passant
-    ----------
-    Fully supported — python-chess includes legal en-passant captures in
-    ``board.legal_moves`` automatically, so no special handling is needed.
-
-    Move cap + Stockfish
-    --------------------
-    If the game reaches ``max_moves`` half-moves without a decisive result,
-    Stockfish evaluates the final position.  If the score exceeds
-    STOCKFISH_WIN_THRESHOLD_CP centipawns the winning side is awarded ±1.0.
-    Otherwise both sides receive 0.0.  Falls back to draw if Stockfish is
-    unavailable.
+    Recommended values
+    ------------------
+      opening_moves = 4   (2 moves each side)  ← default when enabled
+      opening_prob  = 0.5 (apply to half the games so the model also
+                           learns from the standard starting position)
 
     Parameters
     ----------
     model          : PolicyNetwork
     opponent       : agent | None
-        Any object with ``select_move(board) -> chess.Move``, or None for
-        pure self-play.  Use OpponentPool.sample() to get this value.
-    model_color    : bool
-        chess.WHITE or chess.BLACK.  Which colour the training model plays
-        when an opponent is present.  Ignored in self-play (opponent=None).
-    max_moves      : int    Half-move cap (default 200).
-    temp_high      : float  Temperature for first ``temp_threshold`` moves.
-    temp_low       : float  Temperature after ``temp_threshold`` moves.
-    temp_threshold : int    Half-move number to switch temperature.
+    model_color    : bool   chess.WHITE or chess.BLACK.
+    max_moves      : int    Half-move cap.
+    temp_high      : float  Temperature for early moves.
+    temp_low       : float  Temperature for late moves.
+    temp_threshold : int    Half-move to switch temperature.
     device         : str    Torch device.
-    use_stockfish  : bool   If False, skip Stockfish and treat cap as draw.
+    use_stockfish  : bool   If False, treat move cap as draw.
+    opening_moves  : int    Random half-moves to play at game start
+                            (0 = disabled, i.e. always start from the
+                            standard position).
+    opening_prob   : float  Probability [0,1] of applying opening
+                            randomization on any given game.
 
     Returns
     -------
@@ -263,6 +284,22 @@ def run_game(
     env    = ChessEnv()
     record = GameRecord()
     env.reset()
+
+    # -----------------------------------------------------------------------
+    # Opening randomization (Phase 7)
+    # Play `opening_moves` random half-moves before the model takes control.
+    # These moves are NOT stored as training samples — they just diversify
+    # the starting position to prevent opening collapse.
+    # -----------------------------------------------------------------------
+    import random as _rng
+    if opening_moves > 0 and _rng.random() < opening_prob:
+        for _ in range(opening_moves):
+            if env.is_game_over() or _is_early_draw(env.board):
+                break
+            legal = env.get_legal_moves()
+            if not legal:
+                break
+            env.step(_rng.choice(legal))
 
     # raw_samples: (board_tensor, legal_moves, move_index, white_to_move)
     # Only the training model's moves are stored here.
@@ -316,48 +353,59 @@ def run_game(
     # Determine outcome and assign rewards
     # -----------------------------------------------------------------------
 
+    draw_reason = ""
+
     if env.is_game_over():
-        outcome      = env.get_game_result()   # 'white_wins' | 'black_wins' | 'draw'
+        outcome = env.get_game_result()   # 'white_wins' | 'black_wins' | 'draw'
         result_label = outcome
         stockfish_cp = None
-
-    elif _is_early_draw(env.board):
-        outcome      = "draw"
-        result_label = "draw"
-        stockfish_cp = None
+        if outcome == "draw":
+            draw_reason = "checkmate_draw"   # e.g. fivefold/75-move via python-chess
 
     else:
-        # ── Move cap reached ── ask Stockfish ──────────────────────────
-        result_label = "max_moves_reached"
-        stockfish_cp = None
-
-        if use_stockfish:
-            stockfish_cp = _stockfish_evaluate(env.board.fen())
-
-        if stockfish_cp is not None:
-            if stockfish_cp >= STOCKFISH_WIN_THRESHOLD_CP:
-                outcome = "white_wins"
-            elif stockfish_cp <= -STOCKFISH_WIN_THRESHOLD_CP:
-                outcome = "black_wins"
-            else:
-                outcome = "draw"
-                result_label = "max_moves_draw"
-        else:
+        early_draw = _get_draw_reason(env.board)
+        if early_draw:
             outcome      = "draw"
-            result_label = "max_moves_draw"
+            result_label = "draw"
+            draw_reason  = early_draw
+            stockfish_cp = None
+
+        else:
+            # ── Move cap reached ── ask Stockfish ──────────────────────────
+            result_label = "max_moves_reached"
+            stockfish_cp = None
+
+            if use_stockfish:
+                stockfish_cp = _stockfish_evaluate(env.board.fen())
+
+            if stockfish_cp is not None:
+                if stockfish_cp >= STOCKFISH_WIN_THRESHOLD_CP:
+                    outcome = "white_wins"
+                elif stockfish_cp <= -STOCKFISH_WIN_THRESHOLD_CP:
+                    outcome = "black_wins"
+                else:
+                    outcome      = "draw"
+                    result_label = "max_moves_draw"
+                    draw_reason  = "cap_equal"
+            else:
+                outcome      = "draw"
+                result_label = "max_moves_draw"
+                draw_reason  = "cap_equal"
 
     # -----------------------------------------------------------------------
     # Map outcome → per-sample reward
     # -----------------------------------------------------------------------
 
     if is_self_play:
-        # Both sides' moves are stored — assign per-side rewards as before
+        # Both sides' moves are stored — assign per-side rewards.
+        # Reward schedule: Win=+2.0  Draw=-1.0  Loss=-2.0
+        # Draws are penalised to discourage passive play and give learning signal.
         if outcome == "white_wins":
-            white_reward, black_reward =  1.0, -1.0
+            white_reward, black_reward =  2.0, -2.0
         elif outcome == "black_wins":
-            white_reward, black_reward = -1.0,  1.0
+            white_reward, black_reward = -2.0,  2.0
         else:
-            white_reward, black_reward =  0.0,  0.0
+            white_reward, black_reward = -1.0, -1.0   # draw penalises both sides
 
         for (board_tensor, legal_moves, move_index, white_to_move) in raw_samples:
             reward = white_reward if white_to_move else black_reward
@@ -379,12 +427,13 @@ def run_game(
             (outcome == "white_wins" and model_color == chess.BLACK)
         )
 
+        # Reward schedule: Win=+2.0  Draw=-1.0  Loss=-2.0
         if model_won:
-            model_reward = 1.0
+            model_reward = 2.0
         elif model_lost:
-            model_reward = -1.0
+            model_reward = -2.0
         else:
-            model_reward = 0.0
+            model_reward = -1.0   # draw penalised
 
         for (board_tensor, legal_moves, move_index, _white_to_move) in raw_samples:
             record.samples.append(GameSample(
@@ -395,9 +444,11 @@ def run_game(
             ))
 
     record.result        = result_label
+    record.draw_reason   = draw_reason
     record.n_moves       = len(raw_samples)
     record.stockfish_cp  = stockfish_cp
     record.opponent_type = "self"   # overwritten by run_games when pool is used
+    record.model_color   = "both" if is_self_play else ("white" if model_color == chess.WHITE else "black")
     return record
 
 
@@ -415,7 +466,9 @@ def run_games(
     device         : str   = "cpu",
     use_stockfish  : bool  = True,
     verbose        : bool  = False,
-    opponent_pool  = None,   # OpponentPool | None
+    opponent_pool  = None,     # OpponentPool | None
+    opening_moves  : int   = 0,
+    opening_prob   : float = 0.5,
 ) -> list[GameRecord]:
     """
     Run multiple games and return all GameRecords.
@@ -424,14 +477,21 @@ def run_games(
     the model alternates White/Black to remove colour bias.
     When opponent_pool is None all games are pure self-play.
 
-    Always prints a per-agent breakdown after all games complete,
-    regardless of the verbose flag.
+    opening_moves / opening_prob are forwarded to each run_game call
+    (see run_game docstring for details).
+
+    Always prints a per-agent breakdown after all games complete.
     """
     from collections import defaultdict
 
     records: list[GameRecord] = []
-    # {opponent_type: [wins, losses, draws, capped]}
-    agent_counts: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0])
+
+    # Per-agent counters: {opp_name: {metric: count}}
+    # Metrics: games, win, loss, draw, cap_win, cap_loss, cap_draw
+    agent_stats: dict[str, dict] = defaultdict(lambda: dict(
+        games=0, win=0, loss=0, draw=0,
+        cap_win=0, cap_loss=0, cap_draw=0
+    ))
 
     for i in range(n_games):
         if opponent_pool is not None:
@@ -439,7 +499,7 @@ def run_games(
             model_color = chess.WHITE if i % 2 == 0 else chess.BLACK
         else:
             opponent    = None
-            model_color = chess.WHITE   # unused in self-play
+            model_color = chess.WHITE
 
         record = run_game(
             model,
@@ -451,21 +511,56 @@ def run_games(
             temp_threshold = temp_threshold,
             device         = device,
             use_stockfish  = use_stockfish,
+            opening_moves  = opening_moves,
+            opening_prob   = opening_prob,
         )
 
-        # Tag the record with the opponent name — THIS is what was missing
         opp_name             = "self" if opponent is None else type(opponent).__name__
         record.opponent_type = opp_name
 
-        # Tally per-agent outcome: [wins, losses, draws, capped]
-        if record.result == "white_wins":
-            agent_counts[opp_name][0] += 1
-        elif record.result == "black_wins":
-            agent_counts[opp_name][1] += 1
-        elif record.result in ("draw", "max_moves_draw"):
-            agent_counts[opp_name][2] += 1
-        else:
-            agent_counts[opp_name][3] += 1   # max_moves_reached
+        # Tally outcomes from the MODEL's perspective
+        # For self-play, model_color alternates so we track raw game result
+        s = agent_stats[opp_name]
+        s["games"] += 1
+        if record.result in ("white_wins", "black_wins"):
+            # Decisive game — did the model win?
+            is_self_play_game = (opponent is None)
+            if is_self_play_game:
+                # In self-play the model plays both sides — count once as win
+                # (one side wins, the other loses; net = 1 decisive game)
+                s["win"] += 1
+            else:
+                model_won = (
+                    (record.result == "white_wins" and model_color == chess.WHITE) or
+                    (record.result == "black_wins"  and model_color == chess.BLACK)
+                )
+                if model_won:
+                    s["win"] += 1
+                else:
+                    s["loss"] += 1
+        elif record.result == "draw":
+            s["draw"] += 1
+        elif record.result == "max_moves_draw":
+            s["cap_draw"] += 1
+        elif record.result == "max_moves_reached":
+            # Stockfish evaluated — determine winner
+            cp = record.stockfish_cp
+            if cp is not None:
+                is_self_play_game = (opponent is None)
+                if is_self_play_game:
+                    # Self-play: just count as cap_win (decisive result exists)
+                    s["cap_win"] += 1
+                else:
+                    white_better = cp >= STOCKFISH_WIN_THRESHOLD_CP
+                    black_better = cp <= -STOCKFISH_WIN_THRESHOLD_CP
+                    model_is_white = (model_color == chess.WHITE)
+                    model_ahead = (white_better and model_is_white) or                                   (black_better and not model_is_white)
+                    if model_ahead:
+                        s["cap_win"] += 1
+                    else:
+                        s["cap_loss"] += 1
+            else:
+                s["cap_draw"] += 1
 
         records.append(record)
 
@@ -481,14 +576,46 @@ def run_games(
                 f"Result: {record.result}{sf_str}"
             )
 
-    # Always print per-agent summary
-    lines = [f"  Games this epoch: {len(records)}"]
-    for opp_name, (w, l, d, cap) in sorted(agent_counts.items()):
-        n = w + l + d + cap
+    # ── Comprehensive per-agent summary ──────────────────────────────────
+    total_games = len(records)
+    col_w = 7
+    agents_sorted = sorted(agent_stats.keys())
+
+    header = (f"  {'Opponent':<20} {'Games':>{col_w}} {'Win':>{col_w}} "
+              f"{'Loss':>{col_w}} {'Draw':>{col_w}} "
+              f"{'Cap-W':>{col_w}} {'Cap-L':>{col_w}} {'Cap-D':>{col_w}}")
+    sep = "  " + "-" * (20 + 7 * (col_w + 1))
+    lines = [
+        f"  Games this epoch: {total_games}",
+        sep, header, sep,
+    ]
+
+    tot = dict(games=0, win=0, loss=0, draw=0, cap_win=0, cap_loss=0, cap_draw=0)
+    for opp in agents_sorted:
+        s = agent_stats[opp]
+        # Display name: shorten StockfishAgent(depth=8) → Stockfish(d=8) etc.
+        display = opp
+        if opp == "self":               display = "Self-play"
+        elif "Stockfish" in opp:        display = f"Stockfish(d={s.get('_depth', '?')})"
+        elif "Checkpoint" in opp:       display = "Checkpoint"
+        elif "Random" in opp:           display = "Random"
         lines.append(
-            f"    vs {opp_name:<18} {n:>3} games  |  "
-            f"W:{w:<3} L:{l:<3} D:{d:<3} Cap:{cap}"
+            f"  {display:<20} "
+            f"{s['games']:>{col_w}} {s['win']:>{col_w}} {s['loss']:>{col_w}} "
+            f"{s['draw']:>{col_w}} {s['cap_win']:>{col_w}} "
+            f"{s['cap_loss']:>{col_w}} {s['cap_draw']:>{col_w}}"
         )
+        for k in tot:
+            tot[k] += s.get(k, 0)
+
+    lines += [
+        sep,
+        f"  {'TOTAL':<20} "
+        f"{tot['games']:>{col_w}} {tot['win']:>{col_w}} {tot['loss']:>{col_w}} "
+        f"{tot['draw']:>{col_w}} {tot['cap_win']:>{col_w}} "
+        f"{tot['cap_loss']:>{col_w}} {tot['cap_draw']:>{col_w}}",
+        sep,
+    ]
     print("\n".join(lines))
 
     return records
