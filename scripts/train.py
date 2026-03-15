@@ -122,7 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--no-stockfish",        action="store_true",
                    help="Disable Stockfish entirely. Move-cap = draw; "
                         "Stockfish pool slot folds into random.")
-    g.add_argument("--stockfish-depth",     type=int,   default=8,
+    g.add_argument("--stockfish-depth",     type=int,   default=5,
                    help="UCI search depth for Stockfish as pool opponent "
                         "and move-cap evaluator (5 ~ 1600 ELO).")
 

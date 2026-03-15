@@ -398,14 +398,16 @@ def run_game(
 
     if is_self_play:
         # Both sides' moves are stored — assign per-side rewards.
-        # Reward schedule: Win=+2.0  Draw=-1.0  Loss=-2.0
-        # Draws are penalised to discourage passive play and give learning signal.
+        # Reward schedule: Win=+2.0  Draw=0.0  Loss=-2.0
+        # Draws give zero signal — REINFORCE requires rewards centred near zero.
+        # A draw penalty breaks training because CE loss is unbounded positive,
+        # so reward×CE for draws accumulates to -∞ over many epochs.
         if outcome == "white_wins":
             white_reward, black_reward =  2.0, -2.0
         elif outcome == "black_wins":
             white_reward, black_reward = -2.0,  2.0
         else:
-            white_reward, black_reward = -1.0, -1.0   # draw penalises both sides
+            white_reward, black_reward =  0.0,  0.0   # draw = no signal
 
         for (board_tensor, legal_moves, move_index, white_to_move) in raw_samples:
             reward = white_reward if white_to_move else black_reward
@@ -427,13 +429,13 @@ def run_game(
             (outcome == "white_wins" and model_color == chess.BLACK)
         )
 
-        # Reward schedule: Win=+2.0  Draw=-1.0  Loss=-2.0
+        # Reward schedule: Win=+2.0  Draw=0.0  Loss=-2.0
         if model_won:
             model_reward = 2.0
         elif model_lost:
             model_reward = -2.0
         else:
-            model_reward = -1.0   # draw penalised
+            model_reward = 0.0   # draw = no signal
 
         for (board_tensor, legal_moves, move_index, _white_to_move) in raw_samples:
             record.samples.append(GameSample(

@@ -60,7 +60,7 @@ class OpponentPool:
 
     DEFAULT_WEIGHTS: dict[str, float] = {
         "self"       : 0.40,   # max 40% self-play
-        "stockfish"  : 0.30,   # depth-8 Stockfish (falls back to random)
+        "stockfish"  : 0.30,   # depth-5 Stockfish (falls back to random)
         "checkpoint" : 0.20,   # past checkpoints (falls back to stockfish)
         "random"     : 0.10,   # random agent
     }
@@ -75,7 +75,7 @@ class OpponentPool:
         weights                  : dict  | None = None,
         random_seed              : int   | None = None,
         checkpoint_temperature   : float = 0.5,
-        stockfish_depth          : int   = 8,
+        stockfish_depth          : int   = 5,
         device                   : str   = "cpu",
     ):
         self.checkpoint_dir         = checkpoint_dir

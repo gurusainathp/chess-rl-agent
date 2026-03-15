@@ -110,27 +110,27 @@ class TrainingConfig:
     use_opponent_pool      : bool  = True
     pool_size              : int   = 5
     pool_weight_self       : float = 0.40   # hard max 40% self-play
-    pool_weight_stockfish  : float = 0.30   # depth-8; checkpoint folds here if unavailable
+    pool_weight_stockfish  : float = 0.30   # depth-5; checkpoint folds here if unavailable
     pool_weight_checkpoint : float = 0.20   # past selves
     pool_weight_random     : float = 0.10   # random; stockfish folds here if unavailable
     # ------------------------------------------------------------------
     # Replay buffer  (Phase 6)
     # ------------------------------------------------------------------
     use_replay_buffer  : bool  = True
-    replay_capacity    : int   = 100_000  # max positions stored
+    replay_capacity    : int   = 200_000  # max positions stored
     replay_batch_size  : int   = 2_048    # positions sampled per training step
     # ------------------------------------------------------------------
     # Opening randomization  (Phase 7)
     # ------------------------------------------------------------------
     opening_moves      : int   = 4     # random half-moves at game start (0=off)
-    opening_prob       : float = 0.5   # fraction of games that use it
+    opening_prob       : float = 1.0   # all games use opening randomisation
     # ------------------------------------------------------------------
     # Extended evaluation tiers  (Phase 9)
     # ------------------------------------------------------------------
     eval_vs_checkpoint_games : int        = 0     # 0 = skip; auto-set to latest ckpt
     eval_vs_checkpoint_path  : str | None = None
     eval_vs_stockfish_games  : int        = 0     # 0 = skip
-    eval_stockfish_depth     : int        = 8
+    eval_stockfish_depth     : int        = 5
     eval_log_path            : str | None = None  # e.g. "logs/eval_results.json"
 
 
@@ -174,22 +174,34 @@ def compute_loss(
     Compute reward-weighted REINFORCE loss with entropy regularisation.
 
     REINFORCE objective: maximise  E[log π(a|s) * R]
-    As a minimisation loss:        -log π(a|s) * R  =  CE * R
+    As a minimisation loss:        mean( CE(s) × adjusted_R(s) )
 
-    Sign convention
-    ---------------
-    CE loss is always positive.  Multiplying by reward gives:
-      Win  (+2): large positive  → strongly reinforce winning move        ✓
-      Draw (-1): small negative  → mildly suppress passive/drawing moves  ✓
-      Loss (-2): large negative  → strongly suppress losing moves         ✓
+    Reward baseline subtraction
+    ---------------------------
+    Raw rewards (Win=+2, Draw=0, Loss=-2) are centred by subtracting the
+    batch mean before use.  This is standard REINFORCE practice ("baseline"):
 
-    Reward schedule  Win=+2.0  Draw=-1.0  Loss=-2.0
-    Draws carry a penalty to discourage passive play and ensure every game
-    produces a gradient signal (previously draws = 0 = no learning).
+        adjusted_R = R - mean(R)
+
+    Why this matters
+    ----------------
+    Without baseline subtraction, if most games are draws (reward=0) and
+    a handful are losses (reward=-2), the mean reward is slightly negative.
+    Multiplying CE (always positive) by a consistently negative adjusted
+    reward means policy_loss trends toward -∞ over many epochs.
+    Baseline subtraction keeps the effective rewards centred near zero,
+    so wins push the loss positive and losses push it negative symmetrically.
+
+    Reward normalisation
+    --------------------
+    After baseline subtraction, rewards are also divided by their standard
+    deviation (if std > 0).  This makes the gradient scale independent of
+    the raw reward magnitudes (+2/-2 vs +1/-1), so hyperparameters like lr
+    and entropy_coeff stay valid regardless of reward scale choices.
 
     Entropy regularisation
     ----------------------
-    -entropy_coeff * H(π)  is subtracted from the loss to encourage
+    -entropy_coeff × mean_H(π) is subtracted from the loss to encourage
     exploration.  Maximising entropy == minimising its negative.
 
     Parameters
@@ -202,45 +214,51 @@ def compute_loss(
     Returns
     -------
     torch.Tensor  — scalar loss, ready for .backward()
-                    requires_grad=False when all rewards are zero (all draws)
+                    requires_grad=False when all adjusted rewards are zero
     """
-    policy_loss   = torch.zeros((), device=device)
-    entropy_sum   = torch.zeros((), device=device)
-    n_policy      = 0   # non-zero reward samples
-    n_entropy     = 0   # all samples (entropy computed over everything)
+    import math
+
+    # ── Step 1: compute reward baseline (mean and std over this batch) ──
+    all_rewards = [s.reward for s in samples]
+    r_mean = sum(all_rewards) / len(all_rewards) if all_rewards else 0.0
+    r_var  = sum((r - r_mean) ** 2 for r in all_rewards) / len(all_rewards) if all_rewards else 1.0
+    r_std  = math.sqrt(r_var) if r_var > 1e-8 else 1.0
+
+    # ── Step 2: forward pass over all samples ───────────────────────────
+    policy_loss = torch.zeros((), device=device)
+    entropy_sum = torch.zeros((), device=device)
+    n_policy    = 0
+    n_entropy   = 0
 
     for sample in samples:
-        board_t = sample.board_tensor.unsqueeze(0).to(device)   # (1, 13, 8, 8)
-        logits  = model(board_t, sample.legal_moves)             # (1, N_legal)
-        log_probs = F.log_softmax(logits, dim=-1)                # (1, N_legal)
+        board_t   = sample.board_tensor.unsqueeze(0).to(device)   # (1, 13, 8, 8)
+        logits    = model(board_t, sample.legal_moves)             # (1, N_legal)
+        log_probs = F.log_softmax(logits, dim=-1)
         probs     = log_probs.exp()
 
-        # Entropy of this position's distribution
+        # Entropy H(π) for this position (sum over legal moves)
         entropy_sum = entropy_sum - (probs * log_probs).sum()
         n_entropy  += 1
 
-        # Reward schedule: Win=+2.0  Draw=-1.0  Loss=-2.0
-        # All non-zero rewards contribute a gradient signal.
-        # reward=+2 → strongly reinforce winning moves
-        # reward=-1 → mildly suppress draw moves (discourage passivity)
-        # reward=-2 → strongly suppress losing moves
-        if sample.reward == 0.0:
-            continue   # truly zero reward — no signal (should not occur with new schedule)
+        # Baseline-subtracted and normalised reward
+        adj_reward = (sample.reward - r_mean) / r_std
+
+        if abs(adj_reward) < 1e-8:
+            continue   # effectively zero after normalisation — skip
 
         target  = torch.tensor([sample.move_index], dtype=torch.long, device=device)
         ce_loss = F.cross_entropy(logits, target)
 
-        policy_loss = policy_loss + ce_loss * sample.reward
+        policy_loss = policy_loss + ce_loss * adj_reward
         n_policy   += 1
 
     if n_policy > 0:
-        policy_loss = policy_loss / n_policy   # normalise
+        policy_loss = policy_loss / n_policy   # mean over contributing samples
 
     if n_entropy > 0:
-        entropy_sum = entropy_sum / n_entropy  # mean entropy
+        entropy_sum = entropy_sum / n_entropy  # mean entropy per position
 
-    # Total loss: REINFORCE - entropy bonus
-    # (subtracting entropy because we *maximise* entropy, i.e. minimise -H)
+    # Total loss = REINFORCE term − entropy bonus
     total_loss = policy_loss - entropy_coeff * entropy_sum
 
     return total_loss
@@ -412,7 +430,7 @@ def train(
     log.info("  TRAINING")
     log.info(f"    learning rate       : {config.learning_rate}")
     log.info(f"    entropy coeff       : {config.entropy_coeff}  (>0 encourages exploration)")
-    log.info( "    reward schedule     : Win=+2.0  Draw=-1.0  Loss=-2.0")
+    log.info( "    reward schedule     : Win=+2.0  Draw= 0.0  Loss=-2.0  (baseline-normalised)")
 
     # ── Temperature (Phase 1) ─────────────────────────────────────────
     log.info("  TEMPERATURE  (Phase 1)")
@@ -537,12 +555,33 @@ def train(
             entropy_coeff = config.entropy_coeff,
         )
 
+        # ── Health metrics (lead's recommended signals) ──────────────
+        n_nonzero  = sum(1 for s in samples if s.reward != 0.0)
+        pct_nz     = 100.0 * n_nonzero / len(samples) if samples else 0.0
+
+        # Mean entropy over the training batch (forward pass, no grad)
+        mean_ent = 0.0
+        if samples:
+            model.eval()
+            with torch.no_grad():
+                ent_vals = []
+                # Sample up to 200 positions to keep this fast
+                import random as _rnd
+                probe = _rnd.sample(samples, min(200, len(samples)))
+                for s in probe:
+                    bt  = s.board_tensor.unsqueeze(0).to(config.device)
+                    lg  = model(bt, s.legal_moves)
+                    lp  = F.log_softmax(lg, dim=-1)
+                    ent_vals.append(-(lp.exp() * lp).sum().item())
+            mean_ent = sum(ent_vals) / len(ent_vals)
+            model.train()
+
         if loss.requires_grad:
             loss.backward()
             optimiser.step()
             log.info(f"  Training loss     : {loss.item():.6f}")
         else:
-            log.info("  Training loss     : 0.000000  (all draws — no update)")
+            log.info("  Training loss     : 0.000000  (no update — all rewards zero)")
 
         # 4. Record metrics -----------------------------------------------
         wins    = sum(1 for r in records if r.result == "white_wins")
@@ -559,6 +598,10 @@ def train(
                  + (" (from replay)" if replay is not None else ""))
         log.info(f"  Stockfish evals   : {sf_used}")
         log.info(f"  Avg game length   : {avg_len:.1f} half-moves")
+        log.info(f"  Non-zero rewards  : {n_nonzero}/{len(samples)}  ({pct_nz:.1f}%)"
+                 + ("  ✓" if 40 <= pct_nz <= 70 else "  ⚠ target 40–70%"))
+        log.info(f"  Mean entropy      : {mean_ent:.4f}"
+                 + ("  ✓" if mean_ent >= 0.5 else "  ⚠ target ≥ 0.5 (low = collapsing)"))
 
 
         duration = time.time() - epoch_start
